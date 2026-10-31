@@ -51,6 +51,9 @@ class ParsedLine:
     continuation: bool = False
     var: sp.Symbol = X
     error: str | None = None
+    # part index -> (F, var, a, b) for an evaluation bracket [F]_a^b written on that part
+    brackets: dict[int, tuple[sp.Expr, sp.Symbol, sp.Expr, sp.Expr]] = field(default_factory=dict)
+    defines: str | None = None  # "f" for a definition line like f(x) = x^2 sin x
 
     @property
     def ok(self) -> bool:
@@ -64,11 +67,14 @@ def _normalize(text: str) -> str:
         "−": "-", "–": "-", "—": "-", "·": "*", "×": "*", "⋅": "*", "÷": "/",
         "²": "^2", "³": "^3", "π": "pi", "√": " sqrt ", "⁻¹": "^-1", "{": "(", "}": ")",
         "[": "(", "]": ")", "\\int": "∫", "\\cdot": "*", "\\,": " ",
+        "′": "'", "’": "'", "\\left": "", "\\right": "",
     }.items():
         s = s.replace(a, b)
     s = re.sub(r"\\(sin|cos|tan|ln|log|exp|sqrt|sec|csc|cot|pi)\b", r"\1", s)
+    s = re.sub(r"\\frac\(d\)\(d([a-z])\)", r"d/d\1", s)
     s = re.sub(r"\\frac\(([^()]*)\)\(([^()]*)\)", r"((\1)/(\2))", s)
-    s = re.sub(r"\bint\b", "∫", s)
+    s = re.sub(r"\b(?:int|integral)\s+from\s+(\S+)\s+to\s+(\S+)\s*", r"∫_(\1)^(\2) ", s)
+    s = re.sub(r"\b(?:int|integral)\b", "∫", s)
     # |u| -> (Abs(u)); the outer parens stop `ln` from grabbing the "A" as its argument.
     s = re.sub(r"\|([^|]+)\|", r"(Abs(\1))", s)
     # sin^-1 x, tan^(-1) x -> arcsin x, arctan x
@@ -76,12 +82,28 @@ def _normalize(text: str) -> str:
     return s
 
 
+# A limit of integration / evaluation: (0), {pi}, 1, -2.5, pi, a
+LIM = r"(\{[^{}]*\}|\([^()]*\)|-?[0-9.]+|-?[a-zA-Zπ]+)"
+
+
+def _mark_evals(s: str) -> str:
+    """`[F]_a^b` and `F |_a^b` -> `EVAL((F),(a),(b))`. Runs before _normalize eats brackets."""
+    s = s.replace("\\left", "").replace("\\right", "").replace("\\Big", "").replace("\\big", "")
+    s = re.sub(rf"\[([^\[\]=]+)\]\s*_\s*{LIM}\s*\^\s*{LIM}", r"EVAL((\1),(\2),(\3))", s)
+    s = re.sub(rf"([^=|\[\]]+?)\s*\|\s*_\s*{LIM}\s*\^\s*{LIM}", r"EVAL((\1),(\2),(\3))", s)
+    return s
+
+
 def _convert_integrals(s: str) -> tuple[str, sp.Symbol | None]:
-    """Turn `∫ body dx` into `Integral((body), x)`, innermost (rightmost) first."""
+    """Turn `∫ body dx` into `Integral((body), x)` (or `(x, a, b)` for `∫_a^b`), innermost first."""
     var = None
     while "∫" in s:
         i = s.rfind("∫")
         rest = s[i + 1 :]
+        limits = None
+        lm = re.match(rf"\s*_\s*{LIM}\s*\^\s*{LIM}", rest)
+        if lm:
+            limits, rest = (lm.group(1), lm.group(2)), rest[lm.end():]
         # `dx` may be glued to the integrand (`xdx`); no function name contains a "d".
         m = re.search(r"d([a-zA-Z])(?![a-zA-Z(])", rest)
         if m:
@@ -94,8 +116,51 @@ def _convert_integrals(s: str) -> tuple[str, sp.Symbol | None]:
             body, tail, v = rest, "", "x"
         body = body.strip() or "1"
         var = var or sp.Symbol(v)
-        s = f"{s[:i]} Integral(({body}), {v}) {tail}"
+        lim = f"({v}, {limits[0]}, {limits[1]})" if limits else v
+        s = f"{s[:i]} Integral(({body}), {lim}) {tail}"
     return s, var
+
+
+def _match_open(s: str, close: int) -> int | None:
+    """Index of the '(' matching the ')' at s[close]."""
+    depth = 0
+    for j in range(close, -1, -1):
+        depth += {")": 1, "(": -1}.get(s[j], 0)
+        if depth == 0:
+            return j
+    return None
+
+
+def _match_close(s: str, open_: int) -> int | None:
+    depth = 0
+    for j in range(open_, len(s)):
+        depth += {"(": 1, ")": -1}.get(s[j], 0)
+        if depth == 0:
+            return j
+    return None
+
+
+def _convert_derivatives(s: str, defs: dict[str, tuple[sp.Expr, sp.Symbol]]) -> str:
+    """`d/dx (u)`, `(u)'`, `f'(x)`, `y'`, `dy/dx` -> `Derivative((u), x)`."""
+    for name, (_, v) in defs.items():
+        s = re.sub(rf"(?<![a-zA-Z]){name}\s*'\s*(?:\(\s*{v}\s*\))?", f"Derivative((DEF_{name}), {v})", s)
+        s = re.sub(rf"(?<![a-zA-Z])d{name}\s*/\s*d{v}(?![a-zA-Z])", f"Derivative((DEF_{name}), {v})", s)
+    while (i := s.find(")'")) >= 0:
+        j = _match_open(s, i)
+        if j is None:
+            break
+        fm = re.search(rf"(?<![a-zA-Z])({FUNCS})\s*$", s[:j])  # sin(x)' differentiates sin(x)
+        if fm:
+            j = fm.start()
+        s = f"{s[:j]}Derivative(({s[j:i + 1]}), x){s[i + 2:]}"
+    while m := re.search(r"(?<![a-zA-Z])d\s*/\s*d([a-z])(?![a-zA-Z])", s):
+        v, rest = m.group(1), s[m.end():].lstrip()
+        k = _match_close(rest, 0) if rest.startswith("(") else None
+        if k is not None and rest[k + 1:].lstrip().startswith("^"):
+            k = None  # d/dx (x^2+1)^5 differentiates the whole power
+        body, tail = (rest[: k + 1], rest[k + 1:]) if k is not None else (f"({rest})", "")
+        s = f"{s[:m.start()]}Derivative({body}, {v}){tail}"
+    return s
 
 
 def _convert_functions(s: str) -> str:
@@ -109,6 +174,7 @@ def _convert_functions(s: str) -> str:
 def _local_dict(var: sp.Symbol) -> dict[str, Any]:
     return {
         "e": sp.E, "pi": sp.pi, "ln": sp.log, "log": sp.log, "Integral": sp.Integral,
+        "Derivative": sp.Derivative,
         "arcsin": sp.asin, "arccos": sp.acos, "arctan": sp.atan, "Abs": sp.Abs,
         str(var): var, "x": X,
     }
@@ -122,10 +188,25 @@ def _strip_c(part: str) -> tuple[str, bool]:
     return part, False
 
 
-def parse_line(text: str) -> ParsedLine:
-    """Parse one handwritten line into '='-separated SymPy expressions."""
+DEF_RE = re.compile(r"^\s*(?:([a-dfghk-wzA-Z])\s*\(\s*([a-z])\s*\)|(y))\s*=\s*([^=]+)$")
+
+
+def parse_line(text: str, defs: dict[str, tuple[sp.Expr, sp.Symbol]] | None = None) -> ParsedLine:
+    """Parse one handwritten line into '='-separated SymPy expressions.
+
+    `defs` maps names defined on earlier lines (f(x) = ..., y = ...) to (expr, var), so
+    that `f'(x)`, `y'` and `dy/dx` can be read as derivatives.
+    """
+    defs = defs or {}
     line = ParsedLine(text=text)
-    s = _normalize(text)
+    dm = DEF_RE.match(text.replace("−", "-"))
+    if dm and "∫" not in text and "'" not in text:
+        name, v = dm.group(1) or dm.group(3), sp.Symbol(dm.group(2) or "x")
+        rhs = parse_line(dm.group(4), defs)
+        if rhs.ok and len(rhs.parts) == 1 and not rhs.continuation:
+            rhs.text, rhs.defines, rhs.var = text, name, v
+            return rhs
+    s = _normalize(_mark_evals(text))
     if not s:
         line.error = "empty line"
         return line
@@ -133,24 +214,38 @@ def parse_line(text: str) -> ParsedLine:
         line.continuation = True
         s = s[1:]
     raw_parts = [p.strip() for p in s.split("=")]
-    for raw in raw_parts:
+    for k, raw in enumerate(raw_parts):
         if not raw:
             line.parts.append(None)
             line.has_c.append(False)
             line.error = line.error or "empty side of '='"
             continue
         raw, has_c = _strip_c(raw)
-        conv, v = _convert_integrals(raw)
+        conv = _convert_derivatives(raw, defs)
+        conv, v = _convert_integrals(conv)
         if v is not None:
             line.var = v
         conv = _convert_functions(conv)
+        local = _local_dict(line.var)
+        local.update({f"DEF_{n}": e for n, (e, _) in defs.items()})
+        evals: list[tuple[sp.Expr, sp.Symbol, sp.Expr, sp.Expr]] = []
+
+        def _eval_at(F, a, b, _evals=evals):
+            syms = sorted(F.free_symbols, key=str)
+            v_ = syms[0] if len(syms) == 1 else line.var
+            _evals.append((F, v_, a, b))
+            return F.subs(v_, b) - F.subs(v_, a)
+
+        local["EVAL"] = _eval_at
         try:
-            expr = parse_expr(conv, local_dict=_local_dict(line.var), transformations=TRANSFORMS)
+            expr = parse_expr(conv, local_dict=local, transformations=TRANSFORMS)
             if not isinstance(expr, sp.Expr):
                 raise ValueError("not an expression")
         except Exception as exc:  # SymPy raises many exception types on bad input
             expr = None
             line.error = line.error or f"could not read '{raw}' ({type(exc).__name__})"
+        if expr is not None and len(evals) == 1:
+            line.brackets[k] = evals[0]
         line.parts.append(expr)
         line.has_c.append(has_c)
     if v_free := _guess_var(line):
@@ -164,6 +259,8 @@ def _guess_var(line: ParsedLine) -> sp.Symbol | None:
         if p is not None:
             for integ in p.atoms(sp.Integral):
                 return integ.limits[0][0]
+            for der in p.atoms(sp.Derivative):
+                return der.variables[0]
     syms = set().union(*[p.free_symbols for p in line.parts if p is not None]) if line.parts else set()
     if len(syms) == 1:
         return next(iter(syms))
@@ -179,11 +276,17 @@ class _InkPrinter(StrPrinter):
     _names = {"log": "ln", "asin": "arcsin", "acos": "arccos", "atan": "arctan"}
 
     def _print_Integral(self, expr):
-        f, var = expr.function, expr.limits[0][0]
+        f, lim = expr.function, expr.limits[0]
         body = self._print(f)
         if f.is_Add:
             body = f"({body})"
-        return f"∫ {body} d{var}"
+        if len(lim) == 3:
+            return f"∫_{_lim(self._print(lim[1]))}^{_lim(self._print(lim[2]))} {body} d{lim[0]}"
+        return f"∫ {body} d{lim[0]}"
+
+    def _print_Derivative(self, expr):
+        """Inside a line: (u)'. A whole part that is a derivative prints as d/dx (u), see pretty()."""
+        return f"({self._print(expr.expr)})'"
 
     def _print_Function(self, expr):
         name = self._names.get(expr.func.__name__, expr.func.__name__)
@@ -224,10 +327,24 @@ class _InkPrinter(StrPrinter):
         return super()._print_Pow(expr, rational)
 
 
+def _lim(t: str) -> str:
+    """A limit as written after _ or ^: bare if simple, else parenthesised."""
+    return t if re.fullmatch(r"-?[0-9.]+|[a-zA-Z]+", t) else f"({t})"
+
+
+def pretty_bracket(F: sp.Expr, a: sp.Expr, b: sp.Expr) -> str:
+    """`[x^3/3]_0^1`: an antiderivative evaluated between limits (re-parseable)."""
+    return f"[{pretty(F)}]_{_lim(pretty(a))}^{_lim(pretty(b))}"
+
+
 def pretty(expr: sp.Expr) -> str:
     """Ink-friendly text for an expression; re-parseable by parse_line."""
-    s = _InkPrinter().doprint(expr)
+    if isinstance(expr, sp.Derivative):
+        s = f"d/d{expr.variables[0]} ({_InkPrinter().doprint(expr.expr)})"
+    else:
+        s = _InkPrinter().doprint(expr)
     s = s.replace("**", "^").replace("*", " ")
+    s = re.sub(r"\bE\b", "e", s)
     s = re.sub(r"(^|[\s(+\-/])(\d+) (?=[a-zA-Z(])", r"\1\2", s)
     return re.sub(r"\s+", " ", s).strip()
 
@@ -236,7 +353,13 @@ def latex_of(line: ParsedLine) -> str:
     """LaTeX for a parsed line ('' if it did not parse)."""
     if not line.ok:
         return ""
-    bits = [sp.latex(p) + (" + C" if c else "") for p, c in zip(line.parts, line.has_c)]
+    bits = []
+    for k, (p, c) in enumerate(zip(line.parts, line.has_c)):
+        if k in line.brackets:
+            F, _, a, b = line.brackets[k]
+            bits.append(rf"\left[ {sp.latex(F, ln_notation=True)} \right]_{{{sp.latex(a)}}}^{{{sp.latex(b)}}}")
+        else:
+            bits.append(sp.latex(p, ln_notation=True) + (" + C" if c else ""))
     return ("= " if line.continuation else "") + " = ".join(bits)
 
 
@@ -283,17 +406,45 @@ def _const_ratio(a: sp.Expr, b: sp.Expr, var: sp.Symbol) -> sp.Expr | None:
     return None
 
 
+def _has_indef(e: sp.Expr) -> bool:
+    """Has an indefinite integral (∫ f dx, no limits)."""
+    return any(len(i.limits[0]) == 1 for i in e.atoms(sp.Integral))
+
+
+def chain_kind(e: sp.Expr) -> str:
+    """integral (indefinite) | definite | derivative | algebra: what problem a line starts."""
+    if _has_indef(e):
+        return "integral"
+    if e.has(sp.Integral):
+        return "definite"
+    if e.has(sp.Derivative):
+        return "derivative"
+    return "algebra"
+
+
+def evaluate(e: sp.Expr) -> sp.Expr:
+    """Carry out every d/dx and every definite integral (indefinite ones stay)."""
+    repl = {}
+    for d in e.atoms(sp.Derivative):
+        repl[d] = d.doit()
+    for i in e.atoms(sp.Integral):
+        if len(i.limits[0]) == 3:
+            repl[i] = i.doit()
+    return e.xreplace(repl) if repl else e
+
+
 class _Comparator:
     """Equality between consecutive steps: exact, or up to a constant when integrals are involved."""
 
-    def __init__(self, var: sp.Symbol, up_to_constant: bool):
+    def __init__(self, var: sp.Symbol, up_to_constant: bool, kind: str = "integral"):
         self.var = var
         self.up_to_constant = up_to_constant
+        self.kind = kind
 
     def norm(self, e: sp.Expr) -> sp.Expr:
         """What actually gets compared: the derivative (integral chains) or the expression."""
         e = _plain(e)
-        return sp.diff(e, self.var) if self.up_to_constant else e
+        return sp.diff(e, self.var) if self.up_to_constant else evaluate(e)
 
     def same(self, a: sp.Expr, b: sp.Expr) -> bool:
         return _is_zero(self.norm(a) - self.norm(b), self.var)
@@ -334,11 +485,136 @@ def _monomial(expr: sp.Expr, var: sp.Symbol) -> tuple[sp.Expr, sp.Expr] | None:
     return None
 
 
+def _bare_derivative(expr: sp.Expr) -> sp.Expr | None:
+    """If expr is exactly d/dx f, return f."""
+    if isinstance(expr, sp.Derivative) and len(expr.variables) == 1:
+        return expr.expr
+    return None
+
+
+def _bare_definite(expr: sp.Expr) -> tuple[sp.Expr, sp.Symbol, sp.Expr, sp.Expr] | None:
+    """If expr is exactly ∫_a^b f dx, return (f, x, a, b)."""
+    if isinstance(expr, sp.Integral) and len(expr.limits) == 1 and len(expr.limits[0]) == 3:
+        v, a, b = expr.limits[0]
+        return expr.function, v, a, b
+    return None
+
+
+def _inner_args(f: sp.Expr, var: sp.Symbol) -> list[sp.Expr]:
+    """Inner functions of compositions in f: the 3x in sin 3x, the x^2+1 in (x^2+1)^5."""
+    out = []
+    for node in sp.preorder_traversal(f):
+        if isinstance(node, sp.Function):
+            out.extend(a for a in node.args if a != var and var in a.free_symbols)
+        elif node.is_Pow:
+            if node.base == sp.E:
+                out.append(node.exp)
+            elif node.base != var and var in node.base.free_symbols and var not in node.exp.free_symbols:
+                out.append(node.base)
+    return [a for a in dict.fromkeys(out) if sp.diff(a, var) not in (0, 1)]
+
+
+def _diagnose_derivative(f: sp.Expr, cur: sp.Expr, var: sp.Symbol, base: str) -> Diagnosis | None:
+    """Derivative slips: product rule, chain rule, power rule, integrated instead."""
+    right = sp.diff(f, var)
+    fix = pretty(right)
+    close = lambda e: _is_zero(cur - e, var)  # noqa: E731
+
+    coeff, g = f.as_independent(var, as_Add=False)
+    facs = [t for t in sp.Mul.make_args(g) if var in t.free_symbols]
+    if len(facs) >= 2:
+        u, v = facs[0], sp.Mul(*facs[1:])
+        du, dv = sp.diff(u, var), sp.diff(v, var)
+        if close(coeff * du * dv):
+            return Diagnosis(
+                "product_rule", f"product rule: multiplied the derivatives: {base}",
+                {1: "Check the product rule", 2: "(uv)' is u'v + uv', not u'v'", 3: f"= {fix}"}, fix=fix)
+        if close(coeff * du * v) or close(coeff * u * dv):
+            return Diagnosis(
+                "product_rule", f"product rule: forgot a term: {base}",
+                {1: "Check the product rule", 2: "Product rule has two terms: u'v + uv'", 3: f"= {fix}"},
+                fix=fix)
+
+    for h in _inner_args(f, var):
+        dh = sp.diff(h, var)
+        if _is_zero(cur * dh - right, var):
+            return Diagnosis(
+                "chain_rule", f"chain rule: missing inner derivative {pretty(dh)}: {base}",
+                {1: "Check the chain rule", 2: f"Multiply by the derivative of {pretty(h)}", 3: f"= {fix}"},
+                fix=fix)
+
+    mono_in, mono_out = _monomial(f, var), _monomial(cur, var)
+    if mono_in and mono_out and mono_in[1] not in (0, 1):
+        (a, n), (k, m) = mono_in, mono_out
+        if sp.simplify(m - n) == 0:
+            return Diagnosis(
+                "power_rule", f"power rule: did not lower the power: {base}",
+                {1: "Check the power rule", 2: "Lower the power by one", 3: f"= {fix}"}, fix=fix)
+        if sp.simplify(m - n + 1) == 0 and sp.simplify(k - a * n) != 0:
+            return Diagnosis(
+                "power_rule", f"power rule: coefficient should be {pretty(a * n)}: {base}",
+                {1: "Check the power rule", 2: "Bring the old power down in front", 3: f"= {fix}"}, fix=fix)
+
+    return None
+
+
+def _diagnose_integrated(f: sp.Expr, cur: sp.Expr, var: sp.Symbol, base: str) -> Diagnosis | None:
+    """Wrote an antiderivative where a derivative was asked (runs after the sign checks)."""
+    if var in cur.free_symbols and _is_zero(sp.diff(cur, var) - f, var):
+        fix = pretty(sp.diff(f, var))
+        return Diagnosis(
+            "integrated", f"integrated instead of differentiated: {base}",
+            {1: "Differentiate here, don't integrate", 2: "This is an antiderivative, not d/dx",
+             3: f"= {fix}"}, fix=fix)
+    return None
+
+
+def _diagnose_definite(f: sp.Expr, var: sp.Symbol, a: sp.Expr, b: sp.Expr, cur: sp.Expr,
+                       bracket: tuple | None, line_no: int) -> Diagnosis | None:
+    """Definite integral slips: wrong antiderivative in [F]_a^b, limits, forgot to evaluate."""
+    F = sp.integrate(f, var)
+    value = sp.simplify(F.subs(var, b) - F.subs(var, a))
+    good_bracket = pretty_bracket(F, a, b)
+    if bracket is not None:
+        G, v, ga, gb = bracket
+        if not _is_zero(sp.diff(G, v) - f.subs(var, v), v):
+            inner = diagnose(sp.Integral(f, var), G.subs(v, var), _Comparator(var, True), line_no, False)
+            h = dict(inner.hints)
+            h[3] = f"= {good_bracket}"
+            return Diagnosis("antiderivative", f"antiderivative inside the bracket is wrong ({inner.verdict})",
+                             h, fix=good_bracket)
+        if sp.simplify(ga - a) != 0 or sp.simplify(gb - b) != 0:
+            return Diagnosis("limits", f"bracket limits {pretty(ga)}..{pretty(gb)}, integral has {pretty(a)}..{pretty(b)}",
+                             {1: "Check the limits", 2: "Use the same limits as the integral",
+                              3: f"= {good_bracket}"}, fix=good_bracket)
+    if var in cur.free_symbols and _is_zero(sp.diff(cur, var) - f, var):
+        return Diagnosis("no_limits", f"antiderivative not evaluated at {pretty(a)}..{pretty(b)}",
+                         {1: "Now use the limits", 2: "Plug in top minus bottom", 3: f"= {good_bracket}"},
+                         fix=good_bracket)
+    if var not in cur.free_symbols:
+        lo, hi = F.subs(var, a), F.subs(var, b)
+        if value != 0 and _is_zero(cur + value, var):
+            return Diagnosis("limits", f"limits swapped: got {pretty(cur)}, expected {pretty(value)}",
+                             {1: "Check the order of the limits", 2: "It's F(top) minus F(bottom)",
+                              3: f"= {pretty(value)}"}, fix=pretty(value))
+        if sp.simplify(lo) != 0 and _is_zero(cur - hi, var):
+            return Diagnosis("limits", f"lower limit not subtracted: got {pretty(cur)}, expected {pretty(value)}",
+                             {1: "What about the lower limit?", 2: "Subtract F at the bottom limit",
+                              3: f"= {pretty(value)}"}, fix=pretty(value))
+    return None
+
+
+def _trig_sign_hints(t: sp.Expr, fix: str) -> dict[int, str]:
+    rule = "d/dx cos x is −sin x" if t.has(sp.sin) else "d/dx sin x is +cos x"
+    return {1: "Check the sign of that trig derivative", 2: rule, 3: f"= {fix}"}
+
+
 def _with_c(text: str, final: bool) -> str:
     return f"{text} + C" if final else text
 
 
-def diagnose(prev: sp.Expr, cur: sp.Expr, cmp: _Comparator, line_no: int, final: bool) -> Diagnosis:
+def diagnose(prev: sp.Expr, cur: sp.Expr, cmp: _Comparator, line_no: int, final: bool,
+             bracket: tuple | None = None) -> Diagnosis:
     """Explain why `cur` does not follow from `prev`. Detectors run most-specific first."""
     var = cmp.var
     S, D = cmp.norm(cur), cmp.norm(prev)
@@ -346,8 +622,20 @@ def diagnose(prev: sp.Expr, cur: sp.Expr, cmp: _Comparator, line_no: int, final:
     base = f"{what} = {pretty(S)}, expected {pretty(D)}"
     integrand = _bare_integrand(prev)
 
-    # Differentiated instead of integrated: ∫ x^2 dx = 2x
-    if integrand is not None and not cur.has(sp.Integral):
+    definite = _bare_definite(prev)
+    if definite is not None and not cur.has(sp.Integral):
+        d = _diagnose_definite(*definite, cur, bracket, line_no)
+        if d:
+            return d
+    fn = _bare_derivative(prev)
+    if fn is not None and not cur.has(sp.Derivative):
+        d = _diagnose_derivative(fn, cur, var, base)
+        if d:
+            return d
+    trig = cmp.kind == "derivative" and bool(cur.atoms(sp.sin, sp.cos))
+
+    # Differentiated instead of integrated: ∫ x^2 dx = 2x (but ∫ sin x = cos x is a sign slip)
+    if integrand is not None and not cur.has(sp.Integral) and not cmp.same(-cur, prev):
         if _is_zero(cur - sp.diff(integrand, var), var):
             fix = pretty(sp.integrate(integrand, var))
             return Diagnosis(
@@ -359,6 +647,9 @@ def diagnose(prev: sp.Expr, cur: sp.Expr, cmp: _Comparator, line_no: int, final:
     # Whole line has the wrong sign
     if cmp.same(-cur, prev):
         fix = _with_c(pretty(-cur), final)
+        if trig:
+            return Diagnosis("trig_sign", f"sign error on a trig derivative: {base}",
+                             _trig_sign_hints(cur, fix), fix=fix)
         return Diagnosis(
             "sign", f"sign error (whole line negated): {base}",
             {1: "Check your signs here", 2: "The whole line has the wrong sign", 3: f"= {fix}"},
@@ -370,12 +661,20 @@ def diagnose(prev: sp.Expr, cur: sp.Expr, cmp: _Comparator, line_no: int, final:
         for t in terms:
             if cmp.same(cur - 2 * t, prev):
                 fix = _with_c(pretty(cur - 2 * t), final)
+                if trig and t.atoms(sp.sin, sp.cos):
+                    return Diagnosis("trig_sign", f"sign error on trig derivative term {pretty(t)}: {base}",
+                                     _trig_sign_hints(t, fix), fix=fix)
                 return Diagnosis(
                     "sign", f"sign error on term {pretty(t)}: {base}",
                     {1: "Check your signs here",
                      2: f"Sign slip on the {pretty(-t if t.could_extract_minus_sign() else t)} term",
                      3: f"= {fix}"},
                     fix=fix)
+
+    if fn is not None and not cur.has(sp.Derivative):
+        d = _diagnose_integrated(fn, cur, var, base)
+        if d:
+            return d
 
     # Power rule slips: ∫ a x^n dx
     if integrand is not None and not cur.has(sp.Integral):
@@ -392,7 +691,8 @@ def diagnose(prev: sp.Expr, cur: sp.Expr, cmp: _Comparator, line_no: int, final:
                     {1: "Check the power rule", 2: why, 3: f"= {fix} + C"}, fix=f"{fix} + C")
 
     # Missing / extra constant factor (e.g. forgot the 1/2 in ∫ cos 2x dx)
-    r = _const_ratio(S, D, var)
+    numeric = var not in S.free_symbols and var not in D.free_symbols
+    r = None if numeric else _const_ratio(S, D, var)
     if r is not None and r != 1 and r != 0:
         fix = _with_c(pretty(sp.expand(cur / r)), final)
         need = pretty(1 / r)
@@ -409,6 +709,11 @@ def diagnose(prev: sp.Expr, cur: sp.Expr, cmp: _Comparator, line_no: int, final:
         fix = None if expected.has(sp.Integral) else _with_c(pretty(expected), final)
     except Exception:
         fix = None
+    if numeric and cmp.kind == "definite":
+        return Diagnosis(
+            "arithmetic", f"arithmetic: {base}",
+            {1: "Check your arithmetic", 2: "Recompute F(top) − F(bottom)",
+             3: f"= {fix}" if fix else "Recompute F(top) − F(bottom)"}, fix=fix)
     return Diagnosis(
         "not_equal", f"not equal: {base}",
         {1: "This step doesn't follow", 2: "Redo this step from the line above",
@@ -449,6 +754,8 @@ class CheckResult:
     base_value: sp.Expr | None  # last correct expression (where a solver should continue)
     finished: bool  # last correct value has no integral left (in an integral chain)
     integral_chain: bool
+    chain: str = "integral"  # integral | definite | derivative | algebra (the last problem)
+    bracket_pending: bool = False  # last correct step is [F]_a^b: the number is still to write
 
     @property
     def wrong(self) -> LineResult | None:
@@ -465,31 +772,53 @@ def _as_items(lines: list[Any]) -> list[tuple[str, str]]:
     return items
 
 
+def _bracket_ok(prev: sp.Expr, bracket: tuple | None) -> bool:
+    """[F]_a^b right after ∫_a^b f dx: F' must be f (even if the number happens to match)."""
+    definite = _bare_definite(prev)
+    if definite is None or bracket is None:
+        return True
+    f, var, _, _ = definite
+    G, v, _, _ = bracket
+    return _is_zero(sp.diff(G, v) - f.subs(var, v), v)
+
+
 def check_lines(lines: list[Any]) -> CheckResult:
     """Check every step. `lines` are strings or {id, text} dicts, top to bottom.
 
     Only the last chain on the page (from the last line that starts a new problem)
-    drives hints; earlier problems are still checked.
+    drives hints; earlier problems are still checked. A problem is an indefinite
+    integral, a definite integral, a derivative (d/dx, (..)', f'(x) after f(x) = ...),
+    or a definition line f(x) = ... / y = ...
     """
     results: list[LineResult] = []
     prev: sp.Expr | None = None
     last_good: sp.Expr | None = None
     var = X
     integral_chain = False
+    chain = "algebra"
     first_wrong: str | None = None
     verdict = ""
     step_no = 0
+    defs: dict[str, tuple[sp.Expr, sp.Symbol]] = {}
+    bracket_pending = False
 
     for line_id, text in _as_items(lines):
         step_no += 1
-        p = parse_line(text)
+        p = parse_line(text, defs)
         res = LineResult(line_id, text, latex_of(p), "unchecked", p)
         results.append(res)
         if not p.ok:
             continue
-        starts_new = not p.continuation and (prev is None or p.parts[0].has(sp.Integral))
+        if p.defines:
+            defs[p.defines] = (p.parts[0], p.var)
+        head = p.parts[0]
+        starts_new = not p.continuation and (
+            prev is None or p.defines is not None or chain_kind(head) != "algebra")
         if starts_new:
-            prev, var, integral_chain = p.parts[0], p.var, p.parts[0].has(sp.Integral)
+            prev, var = head, p.var
+            bracket_pending = False
+            chain = chain_kind(head)
+            integral_chain = chain == "integral"
             last_good = prev
             res.status = "start"
             offset = 1
@@ -500,18 +829,20 @@ def check_lines(lines: list[Any]) -> CheckResult:
             continue  # after the first error, later lines of the chain stay "unchecked"
         status = res.status if not todo else "ok"
         for k, (expr, has_c) in enumerate(todo):
-            integral_chain = integral_chain or expr.has(sp.Integral)
-            cmp = _Comparator(var, integral_chain)
+            integral_chain = integral_chain or _has_indef(expr)
+            cmp = _Comparator(var, integral_chain, chain)
             final = integral_chain and not expr.has(sp.Integral)
-            if cmp.same(expr, prev):
+            bracket = p.brackets.get(k + offset)
+            if _bracket_ok(prev, bracket) and cmp.same(expr, prev):
                 prev = last_good = expr
+                bracket_pending = bracket is not None
                 if final and not has_c:
                     res.note = "Don't forget + C"
                 elif has_c:
                     res.note = None
                 continue
             status = "wrong"
-            res.diagnosis = diagnose(prev, expr, cmp, step_no, final)
+            res.diagnosis = diagnose(prev, expr, cmp, step_no, final, bracket)
             res.wrong_part = k + offset
             if first_wrong is None:
                 first_wrong, verdict = line_id, res.diagnosis.verdict
@@ -524,10 +855,17 @@ def check_lines(lines: list[Any]) -> CheckResult:
         if r.note == "Don't forget + C":
             r.note = None
 
-    finished = integral_chain and last_good is not None and not last_good.has(sp.Integral)
+    if chain == "integral":
+        finished = last_good is not None and not last_good.has(sp.Integral)
+    elif chain in ("definite", "derivative"):
+        finished = (last_good is not None and not last_good.has(sp.Integral, sp.Derivative)
+                    and not bracket_pending)
+    else:
+        finished = False
     if not verdict:
         verdict = "all steps check out" if any(r.status in ("ok", "start") for r in results) else "nothing to check"
-    return CheckResult(results, first_wrong, verdict, var, last_good, finished, integral_chain)
+    return CheckResult(results, first_wrong, verdict, var, last_good, finished, integral_chain, chain,
+                       bracket_pending)
 
 
 # --------------------------------------------------------------------------- solving
@@ -578,6 +916,58 @@ def _parts_step(value: sp.Expr, var: sp.Symbol) -> sp.Expr | None:
     return value.xreplace(repl) if changed else None
 
 
+def _product_split(f: sp.Expr, var: sp.Symbol) -> tuple[sp.Expr, sp.Expr] | None:
+    """f = u·v with both factors depending on var (constant kept on u), else None."""
+    coeff, g = f.as_independent(var, as_Add=False)
+    facs = [t for t in sp.Mul.make_args(g) if var in t.free_symbols]
+    if len(facs) < 2 or g.is_Pow:
+        return None
+    return coeff * facs[0], sp.Mul(*facs[1:])
+
+
+def _wrap(e: sp.Expr) -> str:
+    t = pretty(e)
+    return f"({t})" if e.is_Add or t.startswith("-") else t
+
+
+def _solve_derivative(value: sp.Expr, var: sp.Symbol) -> list[str]:
+    """`d/dx (u v)` -> product-rule line, then the result. Other derivatives go straight to it."""
+    if not value.has(sp.Derivative):
+        return []
+    steps = []
+    f = _bare_derivative(value)
+    split = _product_split(f, var) if f is not None else None
+    if split:
+        u, v = split
+        steps.append(f"= ({pretty(u)})' {_wrap(v)} + {_wrap(u)} ({pretty(v)})'")
+    result = evaluate(value)
+    if result.has(sp.Derivative):
+        return steps
+    steps.append(f"= {pretty(result)}")
+    return steps
+
+
+def _solve_definite(value: sp.Expr, var: sp.Symbol, pending: bool = False) -> list[str]:
+    """`∫_a^b f dx` -> `[F]_a^b` -> number. A bracket already written goes straight to the number."""
+    definite = _bare_definite(value)
+    steps = []
+    if definite is not None:
+        f, v, a, b = definite
+        F = sp.integrate(f, v)
+        if F.has(sp.Integral):
+            return []
+        steps.append(f"= {pretty_bracket(F, a, b)}")
+        total = sp.simplify(F.subs(v, b) - F.subs(v, a))
+    else:
+        if value.has(sp.Integral):
+            return []
+        total = sp.simplify(evaluate(value))
+        if total == value and not pending:
+            return []
+    steps.append(f"= {pretty(total)}")
+    return steps
+
+
 def solve_remaining(lines: list[Any]) -> list[str]:
     """Steps (as ink text, each starting with '=') that finish the last problem.
 
@@ -588,6 +978,10 @@ def solve_remaining(lines: list[Any]) -> list[str]:
     value, var = res.base_value, res.var
     if value is None:
         return []
+    if res.chain == "derivative":
+        return _solve_derivative(value, var)
+    if res.chain == "definite":
+        return _solve_definite(value, var, res.bracket_pending)
     if not res.integral_chain:
         simp = sp.simplify(value)
         return [] if simp == value else [f"= {pretty(simp)}"]
@@ -624,7 +1018,19 @@ def solve_remaining(lines: list[Any]) -> list[str]:
 def next_step_hints(res: CheckResult) -> dict[int, str] | None:
     """Level 1/2/3 nudges toward the next step when everything so far is right."""
     value, var = res.base_value, res.var
-    if value is None or not value.has(sp.Integral):
+    if value is None:
+        return None
+    if res.chain == "derivative":
+        return _derivative_hints(res)
+    if res.chain == "definite":
+        steps = solve_remaining(res)
+        if res.bracket_pending and steps:
+            return {1: "Now plug in the limits", 2: "Work out F(top) − F(bottom)", 3: f"Next: {steps[0]}"}
+        if _bare_definite(value) is None:
+            return None
+        nxt = f"Next: {steps[0]}" if steps else "Find an antiderivative"
+        return {1: "Find an antiderivative first", 2: "Then do F(top) − F(bottom)", 3: nxt}
+    if not value.has(sp.Integral):
         return None
     integ = sorted(value.atoms(sp.Integral), key=sp.default_sort_key)[0]
     f = integ.function
@@ -643,6 +1049,22 @@ def next_step_hints(res: CheckResult) -> dict[int, str] | None:
     if f.is_Add:
         return {1: "Integrate term by term", 2: "Split it up and integrate each term", 3: nxt}
     return {1: "What differentiates to this?", 2: "Think of a derivative you know", 3: nxt}
+
+
+def _derivative_hints(res: CheckResult) -> dict[int, str] | None:
+    value, var = res.base_value, res.var
+    f = _bare_derivative(value)
+    if f is None:
+        return None
+    steps = solve_remaining(res)
+    nxt = f"Next: {steps[0]}" if steps else "Differentiate what's left"
+    if f.is_Add:
+        return {1: "Differentiate term by term", 2: "Take d/dx of each term separately", 3: nxt}
+    if _product_split(f, var):
+        return {1: "Try the product rule", 2: "(uv)' = u'v + uv'", 3: nxt}
+    if _inner_args(f, var):
+        return {1: "Use the chain rule", 2: "Outer derivative times inner derivative", 3: nxt}
+    return {1: "Use a derivative rule you know", 2: "x^n differentiates to n x^(n-1)", 3: nxt}
 
 
 U = sp.Dummy("u")
