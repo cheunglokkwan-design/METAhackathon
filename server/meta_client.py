@@ -15,16 +15,20 @@ import re
 import threading
 import time
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
 load_dotenv()
 log = logging.getLogger("margin.meta")
 
-BASE_URL = "https://api.meta.ai/v1"
-CHAT_MODEL = "muse-spark-1.3"
-VOICE_MODEL = "muse-voice-transcribe-1.0"
+BASE_URL = os.getenv("MODEL_BASE_URL", "https://api.meta.ai/v1")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "muse-spark-1.3")
+VOICE_MODEL = os.getenv("VOICE_MODEL", "muse-voice-transcribe-1.0")
 INTENTS = ("hint", "answer", "check")
+MAX_IMAGE_CHARS = 5_000_000
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+_DATA_IMAGE_RE = re.compile(r"^data:image/(?:png|jpeg|jpg|webp);base64,[A-Za-z0-9+/=\s]+$", re.A)
 
 
 class OfflineError(RuntimeError):
@@ -35,32 +39,18 @@ class RateLimiter:
     """Thread-safe sliding-window rate limiter for outbound Meta API calls."""
 
     def __init__(self, max_calls: int | None = None, period: float | None = None) -> None:
-        self._max_calls = max_calls
-        self._period = period
+        self._max_calls, self._period = max_calls, period
         self._timestamps: deque[float] = deque()
         self._lock = threading.Lock()
 
-    @property
-    def max_calls(self) -> int:
-        if self._max_calls is not None:
-            return self._max_calls
-        return int(os.getenv("META_RATE_LIMIT_CALLS", "30"))
-
-    @property
-    def period(self) -> float:
-        if self._period is not None:
-            return self._period
-        return float(os.getenv("META_RATE_LIMIT_PERIOD", "60.0"))
-
     def allow(self) -> bool:
-        max_calls = self.max_calls
-        period = self.period
+        max_calls = self._max_calls if self._max_calls is not None else int(os.getenv("META_RATE_LIMIT_CALLS", "30"))
+        period = self._period if self._period is not None else float(os.getenv("META_RATE_LIMIT_PERIOD", "60.0"))
         if max_calls <= 0:
             return False
         now = time.monotonic()
         with self._lock:
-            cutoff = now - period
-            while self._timestamps and self._timestamps[0] <= cutoff:
+            while self._timestamps and self._timestamps[0] <= now - period:
                 self._timestamps.popleft()
             if len(self._timestamps) >= max_calls:
                 return False
@@ -75,39 +65,23 @@ class RateLimiter:
 class CircuitBreaker:
     """Thread-safe circuit breaker (closed -> open -> half_open -> closed)."""
 
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
+    CLOSED, OPEN, HALF_OPEN = "closed", "open", "half_open"
 
-    def __init__(
-        self,
-        failure_threshold: int | None = None,
-        recovery_timeout: float | None = None,
-    ) -> None:
-        self._failure_threshold = failure_threshold
-        self._recovery_timeout = recovery_timeout
-        self._state = self.CLOSED
-        self._failure_count = 0
-        self._opened_at: float = 0.0
-        self._half_open_in_flight = False
+    def __init__(self, failure_threshold: int | None = None, recovery_timeout: float | None = None) -> None:
+        self._threshold, self._timeout = failure_threshold, recovery_timeout
         self._lock = threading.Lock()
+        self.reset()
 
-    @property
-    def failure_threshold(self) -> int:
-        if self._failure_threshold is not None:
-            return self._failure_threshold
-        return max(1, int(os.getenv("META_CB_FAILURE_THRESHOLD", "3")))
-
-    @property
-    def recovery_timeout(self) -> float:
-        if self._recovery_timeout is not None:
-            return self._recovery_timeout
-        return float(os.getenv("META_CB_RECOVERY_TIMEOUT", "60.0"))
+    def _cfg(self) -> tuple[int, float]:
+        t = self._threshold if self._threshold is not None else max(1, int(os.getenv("META_CB_FAILURE_THRESHOLD", "3")))
+        r = self._timeout if self._timeout is not None else float(os.getenv("META_CB_RECOVERY_TIMEOUT", "60.0"))
+        return t, r
 
     @property
     def state(self) -> str:
+        _, timeout = self._cfg()
         with self._lock:
-            if self._state == self.OPEN and (time.monotonic() - self._opened_at) >= self.recovery_timeout:
+            if self._state == self.OPEN and (time.monotonic() - self._opened_at) >= timeout:
                 return self.HALF_OPEN
             return self._state
 
@@ -117,48 +91,41 @@ class CircuitBreaker:
             return self._failure_count
 
     def allow_request(self) -> bool:
+        _, timeout = self._cfg()
         now = time.monotonic()
         with self._lock:
             if self._state == self.CLOSED:
                 return True
             if self._state == self.OPEN:
-                if (now - self._opened_at) >= self.recovery_timeout:
-                    self._state = self.HALF_OPEN
-                    self._half_open_in_flight = True
-                    return True
-                return False
-            if not self._half_open_in_flight:
-                self._half_open_in_flight = True
+                if (now - self._opened_at) < timeout:
+                    return False
+                self._state, self._probe = self.HALF_OPEN, True
+                return True
+            if not self._probe:
+                self._probe = True
                 return True
             return False
 
     def cancel_probe(self) -> None:
-        """Release the half-open probe slot if a request is rejected before calling upstream."""
         with self._lock:
             if self._state == self.HALF_OPEN:
-                self._half_open_in_flight = False
+                self._probe = False
 
     def record_success(self) -> None:
         with self._lock:
-            self._failure_count = 0
-            self._state = self.CLOSED
-            self._half_open_in_flight = False
+            self._failure_count, self._state, self._probe = 0, self.CLOSED, False
 
     def record_failure(self) -> None:
+        threshold, _ = self._cfg()
         now = time.monotonic()
         with self._lock:
             self._failure_count += 1
-            if self._state == self.HALF_OPEN or self._failure_count >= self.failure_threshold:
-                self._state = self.OPEN
-                self._opened_at = now
-                self._half_open_in_flight = False
+            if self._state == self.HALF_OPEN or self._failure_count >= threshold:
+                self._state, self._opened_at, self._probe = self.OPEN, now, False
 
     def reset(self) -> None:
         with self._lock:
-            self._state = self.CLOSED
-            self._failure_count = 0
-            self._opened_at = 0.0
-            self._half_open_in_flight = False
+            self._state, self._failure_count, self._opened_at, self._probe = self.CLOSED, 0, 0.0, False
 
 
 rate_limiter = RateLimiter()
@@ -167,6 +134,16 @@ circuit_breaker = CircuitBreaker()
 
 def api_key() -> str:
     return os.getenv("MODEL_API_KEY", "").strip()
+
+
+def base_url() -> str:
+    """Validated Meta API base URL from MODEL_BASE_URL (HTTPS required except localhost)."""
+    url = os.getenv("MODEL_BASE_URL", BASE_URL).strip()
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if not parsed.netloc or (parsed.scheme != "https" and not (parsed.scheme == "http" and host in ("localhost", "127.0.0.1"))):
+        raise ValueError("MODEL_BASE_URL must be an https:// URL (or http://localhost)")
+    return url
 
 
 def is_offline() -> bool:
@@ -179,12 +156,16 @@ def _client():
         return None
     from openai import OpenAI
 
-    return OpenAI(base_url=BASE_URL, api_key=api_key(), timeout=30.0, max_retries=1)
+    return OpenAI(base_url=base_url(), api_key=api_key(), timeout=30.0, max_retries=1)
 
 
 def _chat(messages: list[dict[str, Any]], max_tokens: int = 400) -> str | None:
     """One chat completion; None on any failure, rate limit, or open circuit."""
-    client = _client()
+    try:
+        client = _client()
+    except Exception as exc:
+        log.warning("Meta client configuration invalid, using offline fallback: %s", exc)
+        return None
     if client is None:
         return None
     if not circuit_breaker.allow_request():
@@ -202,7 +183,7 @@ def _chat(messages: list[dict[str, Any]], max_tokens: int = 400) -> str | None:
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
         circuit_breaker.record_failure()
-        log.warning("Meta API call failed, using offline fallback: %s", exc)
+        log.warning("Meta API call failed, using offline fallback: %s", type(exc).__name__)
         return None
 
 
@@ -233,12 +214,16 @@ where bbox is the line's box in image pixels, origin top-left."""
 
 def read_page(image_dataurl: str) -> list[dict[str, Any]]:
     """Muse Spark vision: page image -> [{text, bbox}]. Empty list offline or on failure."""
-    if not image_dataurl or not image_dataurl.strip() or is_offline():
+    if not image_dataurl or is_offline():
+        return []
+    url = image_dataurl.strip()
+    if len(url) > MAX_IMAGE_CHARS or not _DATA_IMAGE_RE.match(url):
+        log.warning("read_page: rejected invalid or oversized image data URL")
         return []
     reply = _chat(
         [{"role": "user", "content": [
             {"type": "text", "text": READ_PROMPT},
-            {"type": "image_url", "image_url": {"url": image_dataurl}},
+            {"type": "image_url", "image_url": {"url": url}},
         ]}],
         max_tokens=1200,
     )
@@ -322,7 +307,13 @@ def transcribe(audio_bytes: bytes, filename: str = "audio.webm") -> str:
     """Muse Voice Transcribe. Raises OfflineError offline or on failure (caller returns 503)."""
     if not audio_bytes:
         raise OfflineError("empty audio payload")
-    client = _client()
+    if len(audio_bytes) > MAX_AUDIO_BYTES:
+        raise OfflineError("audio payload too large")
+    try:
+        client = _client()
+    except Exception as exc:
+        log.warning("Meta client configuration invalid: %s", exc)
+        raise OfflineError("service unavailable") from exc
     if client is None:
         raise OfflineError("no MODEL_API_KEY")
     if not circuit_breaker.allow_request():
@@ -332,10 +323,12 @@ def transcribe(audio_bytes: bytes, filename: str = "audio.webm") -> str:
         circuit_breaker.cancel_probe()
         log.warning("Meta API rate limit exceeded, skipping transcription")
         raise OfflineError("rate limit exceeded")
+    safe_name = os.path.basename(filename or "audio.webm") or "audio.webm"
     try:
-        resp = client.audio.transcriptions.create(model=VOICE_MODEL, file=(filename, audio_bytes))
+        resp = client.audio.transcriptions.create(model=VOICE_MODEL, file=(safe_name, audio_bytes))
         circuit_breaker.record_success()
     except Exception as exc:
         circuit_breaker.record_failure()
-        raise OfflineError(f"transcription failed: {exc}") from exc
+        log.warning("Meta transcription failed: %s", type(exc).__name__)
+        raise OfflineError("transcription failed") from exc
     return (getattr(resp, "text", None) or "").strip()

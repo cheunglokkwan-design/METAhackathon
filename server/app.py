@@ -23,16 +23,25 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 app = FastAPI(title="Margin", version="0.1.0")
 
 
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    return resp
+
+
 class LineIn(BaseModel):
-    id: str | None = None
-    text: str = ""
+    id: str | None = Field(default=None, max_length=64)
+    text: str = Field(default="", max_length=500)
     bbox: list[float] | None = None
 
 
 class AssistRequest(BaseModel):
-    image: str | None = None
-    lines: list[LineIn] = Field(default_factory=list)
-    command: str = ""
+    image: str | None = Field(default=None, max_length=5_000_000)
+    lines: list[LineIn] = Field(default_factory=list, max_length=100)
+    command: str = Field(default="", max_length=500)
     mode: Literal["hint", "answer", "check", "auto"] = "auto"
     hint_level: int = 1
 
@@ -141,7 +150,7 @@ def assist(req: AssistRequest) -> dict[str, Any]:
 
 @app.post("/api/transcribe")
 async def transcribe(audio: UploadFile = File(...)) -> dict[str, str]:
-    data = await audio.read()
+    data = await audio.read(meta_client.MAX_AUDIO_BYTES + 1)
     try:
         return {"text": meta_client.transcribe(data, audio.filename or "audio.webm")}
     except OfflineError as exc:

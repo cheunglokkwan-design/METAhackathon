@@ -106,6 +106,17 @@ def _convert_functions(s: str) -> str:
     return s
 
 
+MAX_LINE_CHARS = 500
+_SAFE_GLOBALS: dict[str, Any] = {
+    "__builtins__": {},
+    "Symbol": sp.Symbol, "Integer": sp.Integer, "Float": sp.Float, "Rational": sp.Rational,
+    "Function": sp.Function, "Integral": sp.Integral, "Abs": sp.Abs, "pi": sp.pi, "E": sp.E,
+    "sin": sp.sin, "cos": sp.cos, "tan": sp.tan, "sec": sp.sec, "csc": sp.csc, "cot": sp.cot,
+    "asin": sp.asin, "acos": sp.acos, "atan": sp.atan, "sinh": sp.sinh, "cosh": sp.cosh, "tanh": sp.tanh,
+    "exp": sp.exp, "log": sp.log, "sqrt": sp.sqrt,
+}
+
+
 def _local_dict(var: sp.Symbol) -> dict[str, Any]:
     return {
         "e": sp.E, "pi": sp.pi, "ln": sp.log, "log": sp.log, "Integral": sp.Integral,
@@ -125,6 +136,9 @@ def _strip_c(part: str) -> tuple[str, bool]:
 def parse_line(text: str) -> ParsedLine:
     """Parse one handwritten line into '='-separated SymPy expressions."""
     line = ParsedLine(text=text)
+    if len(text) > MAX_LINE_CHARS:
+        line.error = "line too long"
+        return line
     s = _normalize(text)
     if not s:
         line.error = "empty line"
@@ -145,7 +159,9 @@ def parse_line(text: str) -> ParsedLine:
             line.var = v
         conv = _convert_functions(conv)
         try:
-            expr = parse_expr(conv, local_dict=_local_dict(line.var), transformations=TRANSFORMS)
+            if "__" in conv or re.search(r"\.[a-zA-Z_]|\^\s*\d{4,}", raw):
+                raise ValueError("unsafe expression")
+            expr = parse_expr(conv, local_dict=_local_dict(line.var), global_dict=_SAFE_GLOBALS, transformations=TRANSFORMS)
             if not isinstance(expr, sp.Expr):
                 raise ValueError("not an expression")
         except Exception as exc:  # SymPy raises many exception types on bad input
@@ -456,13 +472,8 @@ class CheckResult:
 
 
 def _as_items(lines: list[Any]) -> list[tuple[str, str]]:
-    items = []
-    for i, ln in enumerate(lines, 1):
-        if isinstance(ln, str):
-            items.append((f"L{i}", ln))
-        else:
-            items.append((str(ln.get("id") or f"L{i}"), str(ln.get("text") or "")))
-    return items
+    return [(f"L{i}", ln) if isinstance(ln, str) else (str(ln.get("id") or f"L{i}"), str(ln.get("text") or ""))
+            for i, ln in enumerate(lines, 1)]
 
 
 def check_lines(lines: list[Any]) -> CheckResult:

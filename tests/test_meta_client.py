@@ -145,3 +145,58 @@ def test_transcribe_respects_rate_limiter_and_circuit_breaker(monkeypatch):
     with pytest.raises(OfflineError, match="empty audio"):
         meta_client.transcribe(b"")
     assert dummy.calls == 1
+
+
+def test_security_base_url_validation(monkeypatch):
+    monkeypatch.setenv("MODEL_BASE_URL", "https://api.meta.ai/v1")
+    assert meta_client.base_url() == "https://api.meta.ai/v1"
+
+    monkeypatch.setenv("MODEL_BASE_URL", "http://localhost:8080/v1")
+    assert meta_client.base_url() == "http://localhost:8080/v1"
+
+    # Reject non-HTTPS remote URLs and file/ftp schemes (SSRF & plaintext key protection)
+    for bad in ("http://169.254.169.254/latest/meta-data", "file:///etc/passwd", "ftp://example.com"):
+        monkeypatch.setenv("MODEL_BASE_URL", bad)
+        with pytest.raises(ValueError, match="MODEL_BASE_URL"):
+            meta_client.base_url()
+
+
+def test_security_read_page_rejects_external_urls(monkeypatch):
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    dummy = _DummyClient(reply='{"lines": [{"text": "x", "bbox": [0,0,1,1]}]}')
+    monkeypatch.setattr(meta_client, "_client", lambda: dummy)
+
+    # External URLs or non-image data URLs must not be forwarded to the vision model
+    assert meta_client.read_page("http://169.254.169.254/latest") == []
+    assert meta_client.read_page("data:text/html;base64,AAAA") == []
+    assert dummy.calls == 0
+
+    # Valid base64 image data URL succeeds
+    assert len(meta_client.read_page("data:image/png;base64,AAAA")) == 1
+    assert dummy.calls == 1
+
+
+def test_security_transcribe_does_not_leak_internal_errors(monkeypatch):
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    dummy = _DummyClient(fail=RuntimeError("secret_key=sk-12345 internal url https://secret.internal"))
+    monkeypatch.setattr(meta_client, "_client", lambda: dummy)
+
+    with pytest.raises(OfflineError) as exc_info:
+        meta_client.transcribe(b"audio-bytes", filename="../../etc/passwd")
+    assert "sk-12345" not in str(exc_info.value)
+    assert "secret.internal" not in str(exc_info.value)
+
+
+def test_security_sympy_parser_blocks_builtins_and_dos():
+    from server.checker import parse_line
+
+    for payload in (
+        "__import__('os').system('id')",
+        "x.__class__.__mro__",
+        "eval('1+1')",
+        "x^99999999",
+        "x + " * 200,
+    ):
+        parsed = parse_line(payload)
+        assert not parsed.ok
+

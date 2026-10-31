@@ -286,7 +286,6 @@ export class Notebook {
     });
   }
   hasStrokes() { return this.items.some(it => it.type === 'stroke'); }
-  isEmpty() { return !this.items.length; }
   signature() { return this.items.map(it => it.type === 'text' ? `${it.row}:${it.text}` : it.pts.length).join('|'); }
   occupied(box) { return this.items.some(it => overlap(it.bbox, box)); }
 
