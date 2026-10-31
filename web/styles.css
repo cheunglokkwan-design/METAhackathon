@@ -166,11 +166,6 @@ kbd {
 .meta-layer .tap-target:hover .hit { fill: var(--meta-soft); }
 .page[data-tool="eraser"] .tap-target, .page.meta-hidden .tap-target { pointer-events: none; }
 
-.type-input {
-  position: absolute; height: 36px; padding: 0 2px; margin: 0; border: 0; outline: 0; background: transparent;
-  font: 28px/36px "Patrick Hand", "Bradley Hand", cursive; border-bottom: 1.5px dashed rgba(31,58,122,.3);
-  -webkit-user-select: text; user-select: text; caret-color: currentColor;
-}
 .type-input::placeholder { color: rgba(31,58,122,.28); }
 
 .reading {
@@ -324,7 +319,8 @@ body.on-shelf .mic, body.on-shelf .coach, body.on-shelf .cmd { display: none; }
 @keyframes ring { from { transform: scale(.85); opacity: 1; } to { transform: scale(1.35); opacity: 0; } }
 @keyframes pop { from { transform: translateY(4px) scale(.96); opacity: 0; } }
 
-@media (max-width: 1100px) { .toggle span { display: none; } .toggle { padding: 0 10px; } .crumb b { max-width: 120px; } }
+@media (max-width: 1240px) { .toggle span { display: none; } .toggle { padding: 0 10px; } .tools { gap: 6px; } .seg button { width: 35px; } .sizes button { width: 28px; } .swatches { gap: 6px; } }
+@media (max-width: 1100px) { .crumb b { max-width: 120px; } }
 @media (max-width: 1060px) { .crumb b { display: none; } .sizes { display: none; } }
 @media (max-width: 860px) {
   .swatches button:nth-child(n+4) { display: none; }
@@ -334,3 +330,60 @@ body.on-shelf .mic, body.on-shelf .coach, body.on-shelf .cmd { display: none; }
 @media (hover: none) { .mic .hint { display: none; } }
 @media (max-width: 600px) { .coach { display: none; } .tools { gap: 4px; } .seg button { width: 34px; } .swatches, #auto, #toggle-pages { display: none; } .shelf-grid { grid-template-columns: repeat(2, 1fr); gap: 24px 16px; } }
 @media (prefers-reduced-motion: reduce) { * { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+
+/* ---------- tools: highlighter, lasso, text boxes, pictures ---------- */
+.img-seg { background: none; padding: 3px 0; }
+.img-wrap { position: relative; }
+.img-seg #img-btn[aria-expanded="true"] { background: #fff; color: var(--ui); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
+.seg .img-menu { left: 50%; right: auto; transform: translateX(-50%); width: 290px; }
+.seg .img-menu button { display: flex; flex-direction: column; align-items: flex-start; width: 100%; height: auto; padding: 9px 10px; border-radius: 9px; text-align: left; place-items: initial; }
+.swatches.hl { display: none; }
+.tools[data-tool="highlighter"] .swatches.hl { display: flex; }
+.tools[data-tool="highlighter"] .swatches.pen, .tools:not([data-tool="pen"]) .sizes { display: none; }
+.swatches.hl button { border-radius: 6px; width: 24px; }
+.page[data-tool="lasso"] { cursor: default; }
+.page[data-tool="highlighter"] #live { mix-blend-mode: multiply; }   /* the band being drawn sits under the ink, like the finished one */
+.page.has-bg .paper-head { display: none; }
+
+.tbox-ui { position: absolute; z-index: 3; }
+.tbox-ui::before { content: ""; position: absolute; inset: -4px -8px; border: 1.5px dashed rgba(47,111,224,.45); border-radius: 6px; pointer-events: none; }
+.tbox-ui .type-input {
+  position: static; display: block; width: 100%; height: 44px; padding: 0; margin: 0; border: 0; outline: 0; background: transparent;
+  font: 28px/44px "Patrick Hand", "Bradley Hand", cursive; resize: none; overflow: hidden; white-space: pre-wrap; overflow-wrap: break-word;
+  -webkit-user-select: text; user-select: text; caret-color: currentColor;
+}
+.tbox-grip, .tbox-size { position: absolute; touch-action: none; background: #fff; border: 1.5px solid #2f6fe0; box-shadow: 0 1px 3px rgba(0,0,0,.18); }
+.tbox-grip { left: -30px; top: 8px; width: 18px; height: 26px; border-radius: 6px; cursor: move;
+  background: radial-gradient(circle, #2f6fe0 1.3px, transparent 1.6px) 0 0 / 6px 6px, #fff; background-origin: content-box; padding: 4px 3px; }
+.tbox-size { right: -15px; top: 50%; width: 12px; height: 26px; margin-top: -13px; border-radius: 6px; cursor: ew-resize; }
+.tbox-grip::after, .tbox-size::after { content: ""; position: absolute; inset: -12px; }   /* bigger touch target */
+
+.sel-bar {
+  position: absolute; z-index: 4; transform-origin: 0 0; display: flex; align-items: center; gap: 4px; padding: 5px 6px; white-space: nowrap;
+  border-radius: 13px; background: rgba(255,255,255,.97); border: 1px solid var(--hair); box-shadow: 0 10px 26px -10px rgba(40,30,10,.4);
+  font: 500 13px Inter, system-ui, sans-serif; color: var(--ui); animation: pop .15s ease-out;
+}
+.sel-dots { display: flex; gap: 5px; padding: 0 6px; }
+.sel-dots + .sel-dots, .sel-del { border-left: 1px solid var(--hair); }
+.sel-dots button { width: 20px; height: 20px; border-radius: 50%; background: var(--c); box-shadow: inset 0 0 0 1.5px rgba(0,0,0,.08); }
+.sel-dots.hl button { border-radius: 5px; }
+.sel-dots button:hover { transform: scale(1.12); }
+.sel-del { display: flex; align-items: center; gap: 5px; height: 30px; padding: 0 10px 0 10px; margin-left: 2px; color: #c4321f; border-radius: 0 9px 9px 0; }
+.sel-del svg { width: 17px; height: 17px; }
+.sel-del:hover { background: rgba(196,50,31,.07); }
+
+.meta-layer text.typeset { font-family: "STIX Two Text", "Cambria Math", "Times New Roman", serif; font-weight: 400; }
+.meta-layer path.shade { fill: var(--meta); stroke: none; }
+
+.trace {
+  position: fixed; right: calc(20px + env(safe-area-inset-right)); bottom: calc(76px + env(safe-area-inset-bottom)); z-index: 24;
+  display: flex; align-items: center; gap: 5px; max-width: min(520px, calc(100vw - 40px)); padding: 4px 10px; border-radius: 99px;
+  font: 500 11.5px Inter, system-ui, sans-serif; color: #8a7f78; background: rgba(255,255,255,.72); border: 1px solid rgba(208,69,43,.12);
+  white-space: nowrap; overflow: hidden; opacity: 0; transform: translateY(4px); transition: opacity .5s, transform .5s; pointer-events: none;
+}
+.trace.show { opacity: 1; transform: none; }
+.trace b { color: var(--meta); font-weight: 600; }
+.trace span, .trace i { font-style: normal; opacity: 0; animation: trace-in .3s ease-out forwards; }
+.trace i { color: #c9bdb5; }
+@keyframes trace-in { from { opacity: 0; transform: translateX(-3px); } to { opacity: 1; transform: none; } }
+body.on-shelf .trace { display: none; }

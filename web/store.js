@@ -3,9 +3,10 @@
 //
 // notebook: { id, title, color, pages: [pageId, ...], created, updated }
 // page:     { id, notebookId, paper: 'ruled'|'grid'|'blank', items: [...], meta: [...], updated }
+// blob:     { id, blob, w, h }  photos and PDF pages placed on pages (image items point here by id)
 
-const DB_NAME = 'margin', DB_VERSION = 1;
-const STORES = ['notebooks', 'pages', 'kv'];
+const DB_NAME = 'margin', DB_VERSION = 2;
+const STORES = ['notebooks', 'pages', 'kv', 'blobs'];
 
 const mem = Object.fromEntries(STORES.map(s => [s, new Map()]));
 let dbp = null;
@@ -85,13 +86,20 @@ export const store = {
   putNotebook: nb => put('notebooks', { ...nb, updated: Date.now() }),
   async deleteNotebook(id) {
     const nb = await get('notebooks', id);
-    for (const pid of nb?.pages ?? []) await del('pages', pid);
+    for (const pid of nb?.pages ?? []) await this.deletePage(pid);
     await del('notebooks', id);
   },
 
   getPage: id => get('pages', id),
   putPage: page => put('pages', { ...page, updated: Date.now() }),
-  deletePage: id => del('pages', id),
+  async deletePage(id) {
+    const p = await get('pages', id);
+    for (const it of p?.items ?? []) if (it.type === 'image' && it.blob) await del('blobs', it.blob);
+    await del('pages', id);
+  },
+
+  getBlob: id => get('blobs', id),
+  putBlob: rec => put('blobs', rec),
 
   async getFlag(key) { return (await get('kv', key))?.value; },
   setFlag: (key, value) => put('kv', { key, value }),

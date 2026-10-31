@@ -1,5 +1,6 @@
 // Margin: wires the shelf, the notebook page, pages, Meta's ink, voice and the command pill together.
-import { Notebook, PAGE_W, PAGE_H, PEN_SIZES, baselineOf } from './ink.js';
+import { Notebook, PAGE_W, PAGE_H, PEN_SIZES, rowY, RULE } from './ink.js';
+import { saveImage, savePdfPages, isPdf } from './images.js';
 import { MetaInk, assist } from './assistant.js';
 import { Voice } from './voice.js';
 import { store, newPage, createNotebook } from './store.js';
@@ -18,7 +19,8 @@ const page = $('#page'), desk = $('#desk'), sheet = $('#sheet');
 const nb = new Notebook({
   page, ink: $('#ink'), live: $('#live'), paper: $('#paper'), paintPaper, scroller: desk,
   onErase: (pt, R) => meta.erase(pt, R),
-  onChange: kind => { dismissCoach(); scheduleSave(); if (kind === 'stroke' || kind === 'text') scheduleAutoCheck(); },
+  onChange: kind => { dismissCoach(); scheduleSave(); syncBg(); if (kind === 'stroke' || kind === 'text') scheduleAutoCheck(); },
+  onSelect: box => showSelBar(box),
 });
 const meta = new MetaInk($('#meta'), nb, {
   onReveal: reveal,
@@ -100,6 +102,7 @@ async function showPage(i, { force = false } = {}) {
   nb.load(p.items, histFor(p.id));
   hintMemo = null;
   setPaper(p.paper, false);
+  syncBg();
   page.classList.remove('meta-hidden');
   $('[data-act="hide-meta"]').textContent = 'Hide Meta’s ink';
   $('#page-num').textContent = `${i + 1} / ${state.pages.length}`;
@@ -209,7 +212,7 @@ async function seed() {
   try {
     if (await store.getFlag('seeded')) return;
     if ((await store.listNotebooks()).length) { await store.setFlag('seeded', true); return; }
-    const items = DEMO.map((text, i) => ({ type: 'text', text, x: 150, row: i + 1, baseline: baselineOf(i + 1), color: '#1f3a7a' }));
+    const items = [{ type: 'textbox', x: 150, y: rowY(1) - RULE, w: 820, text: DEMO.join('\n'), color: '#1f3a7a' }];
     await createNotebook({ title: 'Calculus', color: '#2c4a8a', items });
     await createNotebook({ title: 'Physics', color: '#b8473b', paper: 'grid' });
     await store.setFlag('seeded', true);
@@ -220,14 +223,101 @@ async function seed() {
 function setTool(t) {
   nb.setTool(t);
   page.dataset.tool = t;
+  document.querySelector('.tools').dataset.tool = t;
   $$('[data-tool]').forEach(b => b.setAttribute('aria-pressed', b.dataset.tool === t));
 }
 $$('[data-tool]').forEach(b => b.onclick = () => setTool(b.dataset.tool));
-$$('[data-color]').forEach(b => b.onclick = () => {
+$$('.swatches.pen [data-color]').forEach(b => b.onclick = () => {
+  if (nb.tool === 'lasso' && nb.sel.length) { nb.recolorSelection(b.dataset.color, false); return; }
   nb.setColor(b.dataset.color);
-  $$('[data-color]').forEach(x => x.setAttribute('aria-pressed', x === b));
-  if (nb.tool === 'eraser') setTool('pen');
+  $$('.swatches.pen [data-color]').forEach(x => x.setAttribute('aria-pressed', x === b));
+  if (nb.tool === 'eraser' || nb.tool === 'lasso' || nb.tool === 'highlighter') setTool('pen');
 });
+$$('.swatches.hl [data-color]').forEach(b => b.onclick = () => {
+  nb.hlColor = b.dataset.color;
+  $$('.swatches.hl [data-color]').forEach(x => x.setAttribute('aria-pressed', x === b));
+  if (nb.tool !== 'highlighter') setTool('highlighter');
+});
+
+// ---- lasso selection: a small bar above the selection (recolour, delete) ------------------------
+const selBar = $('#sel-bar');
+selBar.addEventListener('pointerdown', e => e.stopPropagation());
+selBar.onclick = e => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  if (b.dataset.recolor) nb.recolorSelection(b.dataset.recolor, b.closest('.hl') != null);
+  if (b.dataset.sel === 'delete') nb.deleteSelection();
+};
+function showSelBar(box) {
+  const selBar = $('#sel-bar');                     // looked up here: zoom calls this while the app is starting
+  if (!box) { selBar.hidden = true; return; }
+  const k = 1 / Math.max(0.3, nb.scale);
+  selBar.hidden = false;
+  const above = box[1] > 64 * k;
+  Object.assign(selBar.style, {
+    left: `${clamp(box[0], 4, PAGE_W - 330 * k)}px`, top: `${above ? box[1] - 8 : box[1] + box[3] + 8}px`,
+    transform: `scale(${k})${above ? ' translateY(-100%)' : ''}`,
+  });
+}
+
+// ---- pictures: insert an image, or start a page from a photo / PDF ---------------------------
+const pickImage = $('#pick-image'), pickPage = $('#pick-page');
+const imgMenu = $('#img-menu'), imgBtn = $('#img-btn');
+const setImgMenu = open => { imgMenu.hidden = !open; imgBtn.setAttribute('aria-expanded', open); };
+imgBtn.onclick = e => { e.stopPropagation(); setImgMenu(imgMenu.hidden); };
+imgMenu.onclick = e => {
+  const act = e.target.closest('[data-img]')?.dataset.img;
+  if (!act) return;
+  setImgMenu(false);
+  (act === 'insert' ? pickImage : pickPage).click();      // synchronous: iOS only opens pickers from a tap
+};
+pickImage.onchange = () => { const f = pickImage.files[0]; pickImage.value = ''; if (f) insertImage(f); };
+pickPage.onchange = () => { const f = pickPage.files[0]; pickPage.value = ''; if (f) pageFromFile(f); };
+
+async function insertImage(file) {
+  if (!current()) return;
+  nb.commitInput();
+  let rec;
+  try { rec = await saveImage(file); } catch (err) { console.warn('[margin] image failed', err); toast('Couldn’t open that picture.'); return; }
+  const r = desk.getBoundingClientRect();
+  const c = zoom.pagePoint({ x: r.left + desk.clientWidth / 2, y: r.top + desk.clientHeight / 2 });
+  const k = Math.min(1, 460 / rec.w, 460 / rec.h), w = rec.w * k, h = rec.h * k;
+  const x = clamp(c.x - w / 2, 20, PAGE_W - w - 20), y = clamp(c.y - h / 2, 110, PAGE_H - h - 20);
+  nb.checkpoint();
+  const it = nb.add({ type: 'image', blob: rec.id, x, y, w, h });
+  setTool('lasso');
+  nb.setSelection([it]);
+  scheduleSave();
+  toast('Picture added. Drag it to move; drag the corner to resize.');
+}
+
+function bgItem(rec) {
+  let w = PAGE_W, h = PAGE_W * rec.h / rec.w;
+  if (h > PAGE_H) { h = PAGE_H; w = PAGE_H * rec.w / rec.h; }
+  return { type: 'image', blob: rec.id, x: (PAGE_W - w) / 2, y: 0, w, h, bg: true };
+}
+async function pageFromFile(file) {
+  if (!state.book) return;
+  await saveNow();
+  let recs;
+  try {
+    if (isPdf(file)) {
+      toast('Reading the PDF…');
+      const out = await savePdfPages(file);
+      recs = out.pages;
+      if (out.total > recs.length) toast(`Added the first ${recs.length} of ${out.total} PDF pages.`);
+    } else recs = [await saveImage(file)];
+  } catch (err) { console.warn('[margin] page import failed', err); toast(isPdf(file) ? 'Couldn’t read that PDF.' : 'Couldn’t open that picture.'); return; }
+  if (!recs.length) return;
+  const at = state.idx + 1;
+  const made = recs.map(rec => ({ ...newPage(state.book.id, 'blank'), items: [bgItem(rec)] }));
+  for (const p of made) await store.putPage(p);
+  state.pages.splice(at, 0, ...made);
+  await persistOrder();
+  await showPage(at);
+  toast(made.length > 1 ? `Added ${made.length} pages from the PDF.` : 'New page from your picture. Write on it, then ask Meta.');
+}
+function syncBg() { page.classList.toggle('has-bg', nb.hasBackground()); }
 $$('[data-size]').forEach(b => b.onclick = () => {
   nb.size = PEN_SIZES[b.dataset.size];
   $$('[data-size]').forEach(x => x.setAttribute('aria-pressed', x === b));
@@ -251,6 +341,7 @@ const setMenu = open => { menu.hidden = !open; more.setAttribute('aria-expanded'
 more.onclick = e => { e.stopPropagation(); setMenu(menu.hidden); };
 document.addEventListener('pointerdown', e => {
   if (!e.target.closest('.menu-wrap')) setMenu(false);
+  if (!e.target.closest('.img-wrap')) setImgMenu(false);
   if (!e.target.closest('#cmd, #mic')) closeCmd();
 });
 menu.onclick = e => {
@@ -306,11 +397,11 @@ async function callMeta(command, mode = 'auto', { escalate = false } = {}) {
   nb.commitInput();
   dismissCoach();
   const lines = nb.lines();
-  if (!lines.length && !nb.hasStrokes()) { toast('Write something on the page first, then ask Meta.'); return; }
+  if (!lines.length && !nb.hasStrokes() && !nb.hasImages()) { toast('Write something on the page first, then ask Meta.'); return; }
   if (/^(more|more help|another hint|next hint|a bit more)\b/i.test(command.trim())) { mode = 'hint'; escalate = true; }
   const sig = nb.signature();
   const payload = { lines, command, mode, hint_level: nextHintLevel(lines, sig, escalate) };
-  if (nb.hasStrokes()) payload.image = nb.snapshot();
+  if (nb.hasStrokes() || nb.hasImages()) payload.image = nb.snapshot();
   const pageId = current().id;
 
   busy = true;
@@ -319,6 +410,7 @@ async function callMeta(command, mode = 'auto', { escalate = false } = {}) {
     const resp = await assist(payload);
     showReading(false);
     if (current()?.id !== pageId) return;           // the student turned the page meanwhile
+    showTrace(resp.agent_trace);
     const wrong = resp.first_wrong && ((resp.lines || []).find(l => l.id === resp.first_wrong) || lines.find(l => l.id === resp.first_wrong));
     hintMemo = resp.mode === 'hint' && wrong ? { sig, text: wrong.text, level: payload.hint_level } : null;
     nb.checkpoint();                                 // undo removes Meta's new ink
@@ -332,6 +424,38 @@ async function callMeta(command, mode = 'auto', { escalate = false } = {}) {
     busy = false;
     showReading(false);
   }
+}
+
+// What Meta did, as a tiny fading breadcrumb by the Hey Meta button: "Meta: read page → checked steps → wrote hint".
+const plural = (n, w) => `${n} ${w}${n === '1' ? '' : 's'}`;
+const TRACE_WORDS = {
+  read_page: () => 'read page',
+  check_steps: s => { const w = /(L\d+) wrong/.exec(s); return w ? `checked steps (${w[1]} wrong)` : 'checked steps'; },
+  give_hint: () => 'wrote hint',
+  finish_answer: s => { const n = /wrote (\d+)/.exec(s)?.[1]; return n ? `wrote ${plural(n, 'step')}` : 'wrote answer'; },
+  typeset_lines: s => { const n = /typeset (\d+)/.exec(s)?.[1]; return n ? `typeset ${plural(n, 'line')}` : 'typeset lines'; },
+  sketch_graph: s => /nothing/.test(s) ? 'nothing to graph' : 'sketched graph',
+  differentiate_check: () => 'differentiated to check',
+  none: () => 'nothing to check',
+  route: () => '', 'muse-spark': () => '',
+};
+const traceWord = t => (TRACE_WORDS[t?.tool] || (() => String(t?.tool || '').replace(/_/g, ' ')))(String(t?.summary || ''));
+let traceTimer;
+function showTrace(trace) {
+  const el = $('#trace');
+  if (!Array.isArray(trace) || !trace.length) return;
+  const steps = trace.map(traceWord).filter(Boolean);
+  if (!steps.length) return;
+  el.replaceChildren(Object.assign(document.createElement('b'), { textContent: 'Meta:' }));
+  steps.slice(0, 5).forEach((s, i) => {
+    if (i) el.append(Object.assign(document.createElement('i'), { textContent: '→', style: `animation-delay:${i * 0.22}s` }));
+    el.append(Object.assign(document.createElement('span'), { textContent: s, style: `animation-delay:${i * 0.22}s` }));
+  });
+  el.title = trace.map(t => `${t.tool}: ${t.summary}`).join('\n');
+  el.hidden = false;
+  el.classList.remove('show'); void el.offsetWidth; el.classList.add('show');
+  clearTimeout(traceTimer);
+  traceTimer = setTimeout(() => { el.classList.remove('show'); traceTimer = setTimeout(() => { el.hidden = true; }, 600); }, 4000);
 }
 
 function showReading(on) {
@@ -388,6 +512,7 @@ addEventListener('keydown', e => {
   const k = e.key.toLowerCase();
   if (mod && !typing && (k === 'y' || (k === 'z' && e.shiftKey))) { e.preventDefault(); nb.redo(); return; }
   if (mod && k === 'z' && !typing) { e.preventDefault(); nb.undo(); return; }
+  if (!typing && !mod && (e.key === 'Delete' || e.key === 'Backspace') && nb.sel.length) { e.preventDefault(); nb.deleteSelection(); return; }
   if (mod && k === 'k') { e.preventDefault(); openCmd(); return; }
   if (mod && (k === '=' || k === '+')) { e.preventDefault(); zoom.zoomBy(1.25); return; }
   if (mod && k === '-') { e.preventDefault(); zoom.zoomBy(0.8); return; }
@@ -397,9 +522,11 @@ addEventListener('keydown', e => {
   else if (k === 'p') setTool('pen');
   else if (k === 'e') setTool('eraser');
   else if (k === 't') setTool('type');
+  else if (k === 'h') setTool('highlighter');
+  else if (k === 'l') setTool('lasso');
   else if (e.key === 'PageDown') { e.preventDefault(); showPage(state.idx + 1); }
   else if (e.key === 'PageUp') { e.preventDefault(); showPage(state.idx - 1); }
-  else if (k === 'escape') { if (!menu.hidden) setMenu(false); else clearMeta(); }
+  else if (k === 'escape') { if (!menu.hidden) setMenu(false); else if (nb.sel.length) nb.clearSelection(); else clearMeta(); }
 });
 
 // ---- voice ------------------------------------------------------------------------------------
@@ -439,13 +566,13 @@ async function demo() {
   nb.items = [];
   nb.redraw();
   desk.scrollTo({ top: 0, behavior: 'smooth' });
-  let last;
+  const box = nb.addText('', 150, 1);
   for (let i = 0; i < DEMO.length; i++) {
-    last = nb.addText('', 150, i + 1);
-    for (const ch of DEMO[i]) { last.text += ch; nb.prepare(last); nb.redraw(); await sleep(22); }
+    if (i) box.text += '\n';
+    for (const ch of DEMO[i]) { box.text += ch; nb.prepare(box); nb.redraw(); await sleep(22); }
     await sleep(120);
   }
-  nb.lastPoint = { x: last.bbox[0] + last.bbox[2], y: last.bbox[1] };
+  nb.lastPoint = { x: box.bbox[0] + box.bbox[2], y: box.bbox[1] + box.bbox[3] - 32 };
   dismissCoach();
   saveNow();
   toast('Demo loaded. Press / and pick “Help me”, or tap Hey Meta.');
@@ -471,4 +598,4 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 })();
 
 // Exposed for debugging and tests.
-window.margin = { nb, meta, zoom, state, callMeta, demo, addPage, showPage, saveNow, store };
+window.margin = { nb, meta, zoom, state, callMeta, demo, addPage, showPage, saveNow, store, setTool, insertImage, pageFromFile };

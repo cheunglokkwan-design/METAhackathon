@@ -25,6 +25,11 @@ function smoothPath(pts) {
   const [lx, ly] = pts.at(-1);
   return d + ` L${lx.toFixed(1)} ${ly.toFixed(1)}`;
 }
+function ptsBox(pts) {
+  const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+  const x0 = Math.min(...xs), y0 = Math.min(...ys);
+  return [x0 - 3, y0 - 3, Math.max(...xs) - x0 + 6, Math.max(...ys) - y0 + 6];
+}
 const measure = (text, px) => { mctx.font = `${px}px ${FONT}, cursive`; return mctx.measureText(text).width; };
 function wrap(text, px, maxW) {
   const out = [];
@@ -46,6 +51,21 @@ function cleanMarkup(g) {
   return c.innerHTML;
 }
 
+// Clean typeset maths: Latin letters in italic (variables), function names and digits upright.
+export const MATH_FONT = '"STIX Two Text", "Cambria Math", "Times New Roman", serif';
+const FUNCS = /^(sin|cos|tan|sec|csc|cot|arcsin|arccos|arctan|sinh|cosh|tanh|ln|log|exp|lim|max|min|d|dx|dy|dt|du|C)$/;
+export function mathRuns(text) {
+  const runs = [];
+  for (const tok of String(text).match(/[A-Za-z]+|[^A-Za-z]+/g) || []) {
+    if (/^[A-Za-z]+$/.test(tok) && !FUNCS.test(tok)) for (const ch of tok) runs.push({ t: ch, it: true });
+    else if (/^d[a-z]$/.test(tok)) runs.push({ t: 'd', it: false }, { t: tok[1], it: true });
+    else runs.push({ t: tok, it: false });
+  }
+  return runs;
+}
+const mathFont = (px, it) => `${it ? 'italic ' : ''}400 ${px}px ${MATH_FONT}`;
+const measureMath = (text, px) => mathRuns(text).reduce((w, r) => { mctx.font = mathFont(px, r.it); return w + mctx.measureText(r.t).width; }, 0);
+
 // Paints Meta's ink onto a 2D canvas (PNG/PDF export, thumbnails). `marks` is serialized data.
 export const META_COLOR = '#d0452b';
 export function paintMeta(ctx, marks = []) {
@@ -54,10 +74,16 @@ export function paintMeta(ctx, marks = []) {
     const g = svgEl('g', {}, root);
     g.innerHTML = d.html;
     const ghost = d.kind === 'ghost';
+    for (const p of g.querySelectorAll('path.shade')) {
+      ctx.save(); ctx.fillStyle = META_COLOR; ctx.globalAlpha = +p.getAttribute('fill-opacity') || 0.14;
+      ctx.fill(new Path2D(p.getAttribute('d'))); ctx.restore();
+    }
     for (const p of g.querySelectorAll('path.ink-stroke')) {
       ctx.save();
-      ctx.globalAlpha = 0.92; ctx.strokeStyle = META_COLOR; ctx.lineCap = ctx.lineJoin = 'round';
+      ctx.globalAlpha = +(p.getAttribute('opacity') ?? 0.92) || 0.92; ctx.strokeStyle = META_COLOR; ctx.lineCap = ctx.lineJoin = 'round';
       ctx.lineWidth = +p.getAttribute('stroke-width') || 2.4;
+      const dash = p.getAttribute('stroke-dasharray');
+      if (dash) ctx.setLineDash(dash.split(/[\s,]+/).map(Number));
       ctx.stroke(new Path2D(p.getAttribute('d')));
       ctx.restore();
     }
@@ -66,9 +92,16 @@ export function paintMeta(ctx, marks = []) {
       const x = +t.getAttribute('x'), y = +t.getAttribute('y');
       const rot = /rotate\(([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)/.exec(t.parentNode.getAttribute?.('transform') || '');
       if (rot) { ctx.translate(+rot[2], +rot[3]); ctx.rotate(+rot[1] * Math.PI / 180); ctx.translate(-rot[2], -rot[3]); }
-      if (t.classList.contains('read-label')) { ctx.font = '500 10.5px Inter, sans-serif'; ctx.fillStyle = '#9aa3ad'; }
-      else { ctx.font = `600 ${t.getAttribute('font-size') || 30}px ${FONT}, cursive`; ctx.fillStyle = META_COLOR; ctx.globalAlpha = ghost ? 0.32 : 1; }
-      ctx.fillText(t.textContent, x, y);
+      if (t.classList.contains('read-label')) { ctx.font = '500 10.5px Inter, sans-serif'; ctx.fillStyle = '#9aa3ad'; ctx.fillText(t.textContent, x, y); }
+      else if (t.classList.contains('typeset')) {
+        const px = +t.getAttribute('font-size') || 24;
+        ctx.fillStyle = META_COLOR;
+        let cx = x;
+        for (const r of mathRuns(t.textContent)) { ctx.font = mathFont(px, r.it); ctx.fillText(r.t, cx, y); cx += ctx.measureText(r.t).width; }
+      } else {
+        ctx.font = `600 ${t.getAttribute('font-size') || 30}px ${FONT}, cursive`; ctx.fillStyle = META_COLOR; ctx.globalAlpha = ghost ? 0.32 : +(t.getAttribute('opacity') ?? 1);
+        ctx.fillText(t.textContent, x, y);
+      }
       ctx.restore();
     }
   }
@@ -107,6 +140,13 @@ export class MetaInk {
     this.marks = [];
     for (const m of gone) { m.g.classList.add('fade'); m.t = setTimeout(() => m.g.remove(), 380); }
     return gone.length;
+  }
+  // Fade out only the marks of the given kinds, so tidy-ups and graphs survive a new hint.
+  clearKinds(kinds) {
+    this.run++;
+    const gone = this.marks.filter(m => kinds.has(m.kind));
+    this.marks = this.marks.filter(m => !kinds.has(m.kind));
+    for (const m of gone) { m.g.classList.add('fade'); m.t = setTimeout(() => m.g.remove(), 380); }
   }
   erase({ x, y }, R) {
     const hit = this.marks.filter(m => m.boxes.some(b => inBox(b, x, y, R / 2)) || m.pts.some(([px, py]) => Math.hypot(px - x, py - y) < R + 3));
@@ -151,7 +191,8 @@ export class MetaInk {
     }
     m.g.addEventListener('click', () => this.onNoteTap(m.note));
   }
-  metaBoxes() { return this.marks.flatMap(m => m.boxes); }
+  // Everything Meta has drawn: text boxes plus the extent of its strokes (circles, ticks, arrows).
+  metaBoxes() { return this.marks.flatMap(m => m.pts.length > 1 ? [...m.boxes, ptsBox(m.pts)] : m.boxes); }
   isFree(box) { return !this.nb.occupied(box) && !this.metaBoxes().some(b => overlap(b, box)); }
   freeRow(r, x, w, n = 1) {
     for (let k = r; k < r + 30 && rowY(k + n - 1) < PAGE_H - 10; k++) {
@@ -167,15 +208,15 @@ export class MetaInk {
     return new Promise(res => {
       const t0 = performance.now();
       const step = now => {
-        const t = Math.min(1, (now - t0) / ms);
+        const t = clamp((now - t0) / ms, 0, 1);            // rAF time can be a little before t0
         fn(t);
         if (t < 1 && token === this.run) requestAnimationFrame(step); else { fn(1); res(); }
       };
       requestAnimationFrame(step);
     });
   }
-  async stroke(m, pts, d, ms, token, width = 2.4) {
-    const p = svgEl('path', { d, class: 'ink-stroke', 'stroke-width': width }, m.g);
+  async stroke(m, pts, d, ms, token, width = 2.4, attrs = {}) {
+    const p = svgEl('path', { d, class: 'ink-stroke', 'stroke-width': width, ...attrs }, m.g);
     m.pts.push(...pts);
     const len = p.getTotalLength() + 1;
     p.style.strokeDasharray = `${len} ${len}`;
@@ -226,12 +267,22 @@ export class MetaInk {
   sizeFor(b, k = 0.95) { return Math.round(clamp((b?.[3] ?? 32) * k, 26, 40)); }   // Meta writes as big as the student
 
   async render(resp, sentLines) {
-    this.clear();
+    // Typeset and graph ink stack with hints; each kind of answer replaces only its own kind.
+    const EXTRAS = new Set(['typeset', 'graph']);
+    const kinds = new Set((resp.annotations || []).map(a => a.kind));
+    const extrasOnly = kinds.size > 0 && [...kinds].every(k => EXTRAS.has(k));
+    if (extrasOnly) this.clearKinds(kinds);
+    else this.clearKinds(new Set(this.marks.map(m => m.kind).filter(k => !EXTRAS.has(k))));
     const token = this.run;
     try { await document.fonts.load(`32px ${FONT}`); } catch { /* fallback font */ }
+    if ((resp.annotations || []).some(a => a.kind === 'typeset')) {
+      try { await Promise.all([document.fonts.load(mathFont(24, false)), document.fonts.load(mathFont(24, true))]); } catch { /* serif fallback */ }
+    }
     this.byId = new Map(sentLines.map(l => [l.id, l]));
     for (const l of resp.lines || []) this.byId.set(l.id, { ...this.byId.get(l.id), ...l, bbox: l.bbox?.length === 4 ? l.bbox : this.byId.get(l.id)?.bbox });
     this.writeRow = null;
+    this.tsAnns = (resp.annotations || []).filter(a => a.kind === 'typeset' && a.text && this.box(a.target));
+    this.tsPlan = null;                               // laid out when the first one is drawn (after the notes)
 
     // Show what Meta read for lines it read from handwriting, so misreads are easy to spot.
     const sentText = new Map(sentLines.map(l => [l.id, l.text]));
@@ -240,7 +291,7 @@ export class MetaInk {
     const anns = [...(resp.annotations || [])];
     const ticked = new Set(anns.filter(a => a.kind === 'tick').map(a => a.target));
     for (const l of resp.lines || []) if (l.status === 'ok' && !ticked.has(l.id)) anns.push({ kind: 'tick', target: l.id });
-    const order = { tick: 0, circle: 1, underline: 2, note: 3, ghost: 4, write: 5 };
+    const order = { tick: 0, circle: 1, underline: 2, note: 3, ghost: 4, write: 5, typeset: 6, graph: 7 };
     const todo = anns.filter(a => a.kind in order).sort((a, b) => order[a.kind] - order[b.kind]);
     if (!todo.length && resp.verdict) todo.push({ kind: 'note', target: null, text: resp.verdict });
     for (const a of todo) {
@@ -300,8 +351,10 @@ export class MetaInk {
     }
     const right = b[0] + b[2] + 60, avail = PAGE_W - 28 - right, full = measure(a.text, px);
     let lines, x, bases, from, to, ctrl;
-    if (a.side !== 'below' && avail >= Math.min(full, 220)) {
-      lines = wrap(a.text, px, avail); x = right;
+    const rightLines = avail > 60 ? wrap(a.text, px, avail) : [];
+    const rightFree = rightLines.length && this.isFree([right - 30, b[1] - 4, Math.max(...rightLines.map(l => measure(l, px))) + 30, rightLines.length * px * 1.02 + 8]);
+    if (a.side !== 'below' && avail >= Math.min(full, 220) && rightFree) {
+      lines = rightLines; x = right;
       const base = b[1] + b[3] * 0.75;
       bases = lines.map((_, i) => base + i * px * 1.02);
       from = [x - 10, base - px * 0.35]; to = [b[0] + b[2] + 22, b[1] + b[3] * 0.45]; ctrl = [(from[0] + to[0]) / 2, Math.min(from[1], to[1]) - 18];
@@ -336,4 +389,180 @@ export class MetaInk {
     }
   }
   a_ghost(a, token) { return this.a_write(a, token, true); }
+
+  // ---- typeset: the neat typed version of each line, in a clean serif ----
+  // One column to the right of everything already on those lines (student ink, notes, circles)
+  // when it fits; otherwise a "neat copy" block in the first free rows below the student's work.
+  planTypeset() {
+    const items = this.tsAnns.map(a => {
+      const b = this.box(a.target), px = Math.round(clamp(b[3] * 0.78, 20, 27));
+      return { a, b, px, w: measureMath(a.text, px) };
+    });
+    const plan = new Map();
+    if (!items.length) return plan;
+    const taken = [...this.metaBoxes(), ...this.nb.items.filter(it => !it.bg).flatMap(it => it.rowBoxes || [it.bbox])];
+    const bandRight = b => Math.max(b[0] + b[2], ...taken.filter(r => r[1] < b[1] + b[3] + 2 && b[1] - 2 < r[1] + r[3] && r[0] < PAGE_W - 40).map(r => r[0] + r[2]));
+    const colX = Math.max(...items.map(it => bandRight(it.b))) + 30;
+    const boxAt = (it, x, base) => [x - 4, base - it.px * 0.85, it.w + 8, it.px * 1.15];
+    if (items.every(it => colX + it.w <= PAGE_W - 24 && this.isFree(boxAt(it, colX, it.b[1] + it.b[3] * 0.78)))) {
+      for (const it of items) plan.set(it.a, { x: colX, base: it.b[1] + it.b[3] * 0.78, px: it.px, w: it.w });
+      return plan;
+    }
+    const x = clamp(Math.min(...items.map(it => it.b[0])), MARGIN_X + 14, PAGE_W - 24 - Math.max(...items.map(it => it.w)));
+    const low = Math.max(...this.nb.lines().map(l => l.bbox[1] + l.bbox[3]), ...items.map(it => it.b[1] + it.b[3]));
+    const r = this.freeRow(rowAt(low) + 1, x - 4, Math.max(160, ...items.map(it => it.w)) + 8, items.length + 1);
+    plan.label = { x, base: baselineOf(r) - 6 };
+    items.forEach((it, i) => plan.set(it.a, { x, base: baselineOf(r + 1 + i), px: it.px, w: it.w }));
+    return plan;
+  }
+
+  async a_typeset(a, token) {
+    if (!this.tsAnns?.includes(a)) return;
+    this.tsPlan ??= this.planTypeset();
+    const p = this.tsPlan.get(a);
+    if (!p) return;
+    if (this.tsPlan.label && !this.tsPlan.labelDone) {
+      this.tsPlan.labelDone = true;
+      const lm = this.mark('typeset');
+      const { x, base } = this.tsPlan.label;
+      const t = svgEl('text', { x, y: base, 'font-size': 18, opacity: 0.75 }, lm.g);
+      t.textContent = 'neat copy';
+      const w = measure('neat copy', 18);
+      const u = [[x, base + 5], [x + w * 0.5, base + 6.5], [x + w, base + 4.5]];
+      lm.boxes.push([x - 4, base - 16, w + 8, 24]);
+      await this.stroke(lm, u, smoothPath(u), 200, token, 1.4, { opacity: 0.5 });
+    }
+    const { x, base, px, w } = p;
+    const m = this.mark('typeset');
+    const box = [x - 4, base - px * 0.85, w + 8, px * 1.15];
+    m.boxes.push(box);
+    this.onReveal?.(box);
+    const id = `mclip${++this.n}`;
+    const rect = svgEl('rect', { x: x - 4, y: base - px * 1.3, width: 0, height: px * 1.9 }, svgEl('clipPath', { id }, this.defs));
+    const g = svgEl('g', { 'clip-path': `url(#${id})` }, m.g);
+    const t = svgEl('text', { x, y: base, 'font-size': px, class: 'typeset' }, g);
+    for (const r of mathRuns(a.text)) { const s = svgEl('tspan', r.it ? { 'font-style': 'italic' } : {}, t); s.textContent = r.t; }
+    await this.tween(Math.max(300, [...a.text].length * 18), q => rect.setAttribute('width', (w + 10) * q), token);
+  }
+
+  // ---- graph: a small hand-sketched plot in the right margin near the line (or under it) ----
+  graphSpot(anchor, W, H) {
+    const tries = [];
+    const y0 = anchor ? clamp(anchor[1] - 10, 90, PAGE_H - H - 10) : 120;
+    for (const x of [PAGE_W - 24 - W, PAGE_W - 24 - W - 110]) for (let dy = 0; y0 + dy + H < PAGE_H - 10 && dy < 520; dy += RULE) tries.push([x, y0 + dy]);
+    for (const x of [MARGIN_X + 40, MARGIN_X + 300]) {
+      const r = anchor ? rowAt(anchor[1] + anchor[3]) + 1 : 2;
+      for (let k = r; rowY(k) + H < PAGE_H - 10 && k < r + 25; k++) tries.push([x, rowY(k) - RULE + 10]);
+    }
+    for (const [x, y] of tries) if (this.isFree([x - 8, y - 8, W + 16, H + 16])) return [x, y];
+    return tries[0] || [PAGE_W - 24 - W, 120];
+  }
+
+  async a_graph(a, token) {
+    const pts = (a.points || []).filter(p => Array.isArray(p) && p.length >= 2);
+    const [x0, x1] = a.xrange?.length === 2 ? a.xrange : pts.length ? [Math.min(...pts.map(p => p[0])), Math.max(...pts.map(p => p[0]))] : [0, 1];
+    const fin = pts.map(p => p[1]).filter(Number.isFinite);
+    const [y0, y1] = a.yrange?.length === 2 ? a.yrange : fin.length ? [Math.min(...fin), Math.max(...fin)] : [0, 1];
+    if (!pts.length || !(x1 > x0) || !(y1 > y0)) return;
+    const W = 260, H = 180;
+    const anchor = this.box(a.after) || this.lastBox();
+    const [gx, gy] = this.graphSpot(anchor, W, H);
+    const m = this.mark('graph');
+    m.boxes.push([gx, gy, W, H]);
+    this.onReveal?.([gx, gy, W, H]);
+    const twoRows = (a.overlay || []).length > 1 && a.fn;
+    const L = gx + 16, R = gx + W - 12, T = gy + (twoRows ? 48 : 30), B = gy + H - 14;
+    const sx = x => L + (x - x0) / (x1 - x0) * (R - L), sy = y => B - (y - y0) / (y1 - y0) * (B - T);
+    const wob = (pa, pb, n = 8) => {
+      const out = [];
+      for (let i = 0; i <= n; i++) { const t = i / n, j = i && i < n ? rand(-0.7, 0.7) : 0; out.push([pa[0] + (pb[0] - pa[0]) * t + (pa[1] === pb[1] ? 0 : j), pa[1] + (pb[1] - pa[1]) * t + (pa[1] === pb[1] ? j : 0)]); }
+      return out;
+    };
+    // axes through the origin when it is in view, else along the edges
+    const ax = y0 <= 0 && y1 >= 0 ? sy(0) : B, ay = x0 <= 0 && x1 >= 0 ? sx(0) : L;
+    const xAxis = wob([L - 6, ax], [R + 4, ax]), yAxis = wob([ay, B + 4], [ay, T - 8]);
+    const head = (tip, dir) => dir === 'x' ? `M${tip[0] - 7} ${tip[1] - 4} L${tip[0]} ${tip[1]} L${tip[0] - 7} ${tip[1] + 4}` : `M${tip[0] - 4} ${tip[1] + 7} L${tip[0]} ${tip[1]} L${tip[0] + 4} ${tip[1] + 7}`;
+    await this.stroke(m, xAxis, smoothPath(xAxis) + head(xAxis.at(-1), 'x'), 260, token, 1.5, { opacity: 0.55 });
+    await this.stroke(m, yAxis, smoothPath(yAxis) + head(yAxis.at(-1), 'y'), 220, token, 1.5, { opacity: 0.55 });
+    for (const [t, x, y] of [['x', R + 2, ax + 16], ['y', ay + 7, T - 2]]) {
+      const lt = svgEl('text', { x, y, 'font-size': 16, opacity: 0.7 }, m.g); lt.textContent = t;
+    }
+    const segs = graphSegments(pts, y0, y1).map(s => s.map(([x, y]) => [sx(x), sy(y)]));
+    // shaded area for a definite integral
+    if (Array.isArray(a.shade) && a.shade.length === 2) {
+      const [sa, sb] = [Math.min(...a.shade), Math.max(...a.shade)];
+      const inside = pts.filter(p => Number.isFinite(p[1]) && p[0] >= sa && p[0] <= sb).map(([x, y]) => [sx(x), sy(clamp(y, y0, y1))]);
+      if (inside.length > 1) {
+        const d = `M${inside[0][0].toFixed(1)} ${ax.toFixed(1)} ` + inside.map(([x, y]) => `L${x.toFixed(1)} ${y.toFixed(1)}`).join(' ') + ` L${inside.at(-1)[0].toFixed(1)} ${ax.toFixed(1)} Z`;
+        const sh = svgEl('path', { d, class: 'shade', 'fill-opacity': 0.14 }, m.g);
+        sh.style.opacity = 0;
+        await this.tween(300, t => { sh.style.opacity = t; }, token);
+        sh.removeAttribute('style');
+      }
+    }
+    // the curve, sketched left to right
+    const total = segs.reduce((n, s) => n + s.length, 0) || 1;
+    for (const s of segs) {
+      if (token !== this.run) return;
+      if (s.length > 1) await this.stroke(m, s, smoothPath(s), Math.max(120, 1100 * s.length / total), token, 2.2);
+    }
+    // overlay (e.g. the integrand under its antiderivative): dashed, revealed left to right
+    const ov = (a.overlay || []).filter(p => Array.isArray(p) && p.length >= 2);
+    if (ov.length > 1) {
+      const id = `mclip${++this.n}`;
+      const rect = svgEl('rect', { x: L - 4, y: gy, width: 0, height: H }, svgEl('clipPath', { id }, this.defs));
+      const g = svgEl('g', { 'clip-path': `url(#${id})` }, m.g);
+      for (const s of graphSegments(ov, y0, y1).map(s => s.map(([x, y]) => [sx(x), sy(y)]))) {
+        if (s.length > 1) { svgEl('path', { d: smoothPath(s), class: 'ink-stroke', 'stroke-width': 1.7, 'stroke-dasharray': '6 5', opacity: 0.75 }, g); m.pts.push(...s); }
+      }
+      await this.tween(700, t => rect.setAttribute('width', (R - L + 12) * t), token);
+    }
+    // legend: which curve is which (solid = fn, dashed = overlay)
+    const cut = (t, n) => t.length > n ? t.slice(0, n - 1) + '…' : t;
+    if (a.fn) {
+      const two = ov.length > 1;
+      const tx = two ? gx + 30 : gx + 4;
+      if (two) { const sw = [[gx + 4, gy + 11], [gx + 24, gy + 11]]; await this.stroke(m, sw, smoothPath(sw), 120, token, 2.2, { opacity: 0.92, 'data-legend': 1 }); }
+      await this.write(m, cut(`y = ${a.fn}`, two ? 30 : 34), tx, gy + 16, 19, token);
+      if (two) {
+        const sw = [[gx + 4, gy + 31], [gx + 24, gy + 31]];
+        svgEl('path', { d: smoothPath(sw), class: 'ink-stroke', 'stroke-width': 1.7, 'stroke-dasharray': '6 5', opacity: 0.75 }, m.g);
+        await this.write(m, cut(a.overlay_fn ? `y = ${a.overlay_fn}` : 'overlay', 30), tx, gy + 36, 19, token);
+      }
+    }
+  }
+}
+
+// Samples -> drawable runs: breaks at gaps (a jump in x of more than ~2x the usual step,
+// non-finite values) and clips each run to the y range, cutting it where it leaves the box.
+export function graphSegments(points, y0, y1) {
+  const pts = points.filter(p => Number.isFinite(p[0])).sort((a, b) => a[0] - b[0]);
+  const steps = [];
+  for (let i = 1; i < pts.length; i++) steps.push(pts[i][0] - pts[i - 1][0]);
+  const step = steps.length ? steps.slice().sort((a, b) => a - b)[Math.floor(steps.length / 2)] : 0;
+  const out = [];
+  let cur = [];
+  const flush = () => { if (cur.length > 1) out.push(cur); cur = []; };
+  const inR = y => y >= y0 && y <= y1;
+  for (let i = 0; i < pts.length; i++) {
+    const [x, y] = pts[i], prev = pts[i - 1];
+    if (!Number.isFinite(y)) { flush(); continue; }
+    if (prev && Number.isFinite(prev[1]) && step && x - prev[0] > 2.2 * step) flush();
+    const pin = prev && Number.isFinite(prev[1]) && !(step && x - prev[0] > 2.2 * step);
+    if (inR(y)) {
+      if (pin && !inR(prev[1])) {                       // re-entering: start at the edge
+        const e = prev[1] > y1 ? y1 : y0, t = (e - prev[1]) / (y - prev[1]);
+        cur.push([prev[0] + t * (x - prev[0]), e]);
+      }
+      cur.push([x, y]);
+    } else {
+      if (pin && inR(prev[1])) {                        // leaving: end at the edge
+        const e = y > y1 ? y1 : y0, t = (e - prev[1]) / (y - prev[1]);
+        cur.push([prev[0] + t * (x - prev[0]), e]);
+      }
+      flush();
+    }
+  }
+  flush();
+  return out;
 }

@@ -80,7 +80,7 @@ export class Zoom {
     }
     if (this.touches.size > 2) { e.stopPropagation(); return; }
     const onPage = this.page.contains(e.target);
-    if (e.target.closest('.type-input, .tap-target')) return;
+    if (e.target.closest('.tbox-ui, .tap-target, .sel-bar')) return;
     if (onPage && !this.nb.penSeen) return;              // finger writes, like a stylus
     this.mode = { kind: 'pan', id: e.pointerId, x: e.clientX, y: e.clientY };
     e.stopPropagation();

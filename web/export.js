@@ -1,6 +1,7 @@
 // Renders stored pages to canvas: sidebar thumbnails, "Export page as PNG", "Export notebook as PDF".
-import { PAGE_W, PAGE_H, prepareItem, paint } from './ink.js';
+import { PAGE_W, PAGE_H, prepareItem, paintItems, normalizeItem } from './ink.js';
 import { paintMeta } from './assistant.js';
+import { loadItemImages } from './images.js';
 
 const PAPER = '#fcf9f2', RULE_C = '#cddbea', GRID_C = '#dfe6ee', MARGIN_C = '#e6a29c';
 
@@ -25,7 +26,7 @@ export function paintPaper(c, paper = 'ruled') {
 
 export function paintPage(c, page, { meta = true } = {}) {
   paintPaper(c, page.paper);
-  for (const it of page.items || []) paint(c, prepareItem({ ...it }));
+  paintItems(c, (page.items || []).map(it => prepareItem({ ...normalizeItem(it) })));
   if (meta) paintMeta(c, page.meta || []);
 }
 
@@ -38,7 +39,12 @@ export function renderPage(page, scale = 2) {
   return cv;
 }
 
+// Paints at once with the pictures already decoded, then again once the rest have loaded.
 export function drawThumb(canvas, page) {
+  paintThumb(canvas, page);
+  loadItemImages(page.items).then(n => { if (n) paintThumb(canvas, page); });
+}
+function paintThumb(canvas, page) {
   const r = Math.min(2, window.devicePixelRatio || 1), w = canvas.clientWidth || 120;
   const s = (w * r) / PAGE_W;
   canvas.width = Math.round(PAGE_W * s); canvas.height = Math.round(PAGE_H * s);
@@ -62,6 +68,7 @@ async function deliver(blob, filename) {
 }
 
 export async function exportPNG(page, title, n) {
+  await loadItemImages(page.items);
   const cv = renderPage(page, 2);
   const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
   await deliver(blob, `${safeName(title)}-page-${n}.png`);
@@ -82,6 +89,7 @@ function loadJsPDF() {
 
 export async function exportPDF(pages, title) {
   const { jsPDF } = await loadJsPDF();
+  for (const p of pages) await loadItemImages(p.items);
   const W = 595, H = W * PAGE_H / PAGE_W;                  // A4 width, page aspect
   const doc = new jsPDF({ unit: 'pt', format: [W, H], orientation: 'portrait', compress: true });
   pages.forEach((p, i) => {
