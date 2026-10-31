@@ -21,7 +21,8 @@ log = logging.getLogger("margin.meta")
 BASE_URL = "https://api.meta.ai/v1"
 CHAT_MODEL = "muse-spark-1.3"
 VOICE_MODEL = "muse-voice-transcribe-1.0"
-INTENTS = ("hint", "answer", "check")
+INTENTS = ("hint", "answer", "check", "typeset", "graph", "verify")
+AGENT_MAX_ITERS = 4
 
 
 class OfflineError(RuntimeError):
@@ -119,8 +120,14 @@ def read_page(image_dataurl: str) -> list[dict[str, Any]]:
 
 
 def keyword_intent(command: str) -> str:
-    """Offline intent: answer / check / hint from keywords."""
+    """Offline intent from keywords: typeset / graph / verify / answer / check / hint."""
     c = (command or "").lower()
+    if any(k in c for k in ("tidy", "typeset", "neat", "type it up", "clean up", "write it out properly")):
+        return "typeset"
+    if any(k in c for k in ("graph", "plot", "sketch", "draw the curve", "draw it")):
+        return "graph"
+    if "check" in c and any(k in c for k in ("differentiat", "derivative")):
+        return "verify"  # "check it by differentiating"
     if any(k in c for k in ("answer", "solution", "solve it", "finish", "just give", "show me how", "do it for me")):
         return "answer"
     if any(k in c for k in ("check", "is this right", "am i right", "correct?", "verify")):
@@ -129,17 +136,116 @@ def keyword_intent(command: str) -> str:
 
 
 def classify_intent(command: str) -> str:
-    """hint | answer | check. Muse Spark when online, keywords otherwise."""
+    """One of INTENTS. Muse Spark when online, keywords otherwise."""
     if not command or is_offline():
         return keyword_intent(command)
     reply = _chat([
         {"role": "system", "content": "Classify a student's request to a math tutor. Reply with exactly one word: "
          "hint (wants help or a nudge), answer (wants the full solution or remaining steps), "
-         "or check (wants to know whether their work is right)."},
+         "check (wants to know whether their work is right), typeset (wants the page tidied or typed up), "
+         "graph (wants a graph or sketch), or verify (wants the answer checked by differentiating)."},
         {"role": "user", "content": command},
     ], max_tokens=5)
     word = (reply or "").strip().lower().strip(".!\"'")
     return word if word in INTENTS else keyword_intent(command)
+
+
+# --------------------------------------------------------------------------- agent loop
+
+AGENT_PROMPT = """You are Margin, a calculus tutor that writes tiny notes in ink on a student's notebook page.
+You act ONLY through tools. Every tool runs a SymPy referee on the page and writes the ink itself;
+you never write mathematics, answers or hints yourself.
+Pick the tool(s) that match the request, usually exactly one:
+- help / stuck / hint / what next -> give_hint
+- is this right / check -> check_steps
+- just give me the answer / finish it -> finish_answer
+- tidy / typeset / neat -> typeset_lines
+- graph / plot / sketch -> sketch_graph
+- check by differentiating -> differentiate_check
+You may combine two (e.g. "check it and graph it"). Never call finish_answer unless the student
+asked for the answer. When you are done, reply with the single word DONE."""
+
+
+def _page_text(lines: list[dict[str, Any]]) -> str:
+    return "\n".join(f"{l.get('id') or f'L{i}'}: {l.get('text', '')}" for i, l in enumerate(lines, 1))
+
+
+def _tool_calls_of(msg: Any) -> list[tuple[str, str, dict[str, Any]]]:
+    """[(id, name, args)] from an SDK message; malformed arguments become {}."""
+    out = []
+    for i, call in enumerate(getattr(msg, "tool_calls", None) or []):
+        fn = getattr(call, "function", None)
+        name = getattr(fn, "name", None)
+        if not name:
+            continue
+        try:
+            args = json.loads(getattr(fn, "arguments", None) or "{}")
+        except ValueError:
+            args = {}
+        out.append((getattr(call, "id", None) or f"call_{i}", name, args if isinstance(args, dict) else {}))
+    return out
+
+
+def run_agent(command: str, lines: list[dict[str, Any]], image: str | None = None,
+              hint_level: int = 1, toolbox: Any = None) -> dict[str, Any] | None:
+    """Muse Spark picks tools; each runs locally (server.skills) and its result feeds back.
+
+    At most AGENT_MAX_ITERS model calls. The page's annotations come only from tool
+    results. A plain-text reply with no tool call falls back to keyword routing.
+    Returns {"mode", "annotations", "agent_trace"}, or None when offline or the very first
+    model call fails (the caller then routes by keywords).
+    """
+    client = _client()
+    if client is None:
+        return None
+    from .skills import TOOL_SPECS, Toolbox  # local import: skills imports this module
+
+    box = toolbox or Toolbox(lines, hint_level)
+    user: list[dict[str, Any]] = [{"type": "text", "text": f"Student said: {command or '(nothing)'}\n"
+                                   f"Page lines:\n{_page_text(lines) or '(none)'}"}]
+    if image:
+        user.append({"type": "image_url", "image_url": {"url": image}})
+    messages: list[dict[str, Any]] = [{"role": "system", "content": AGENT_PROMPT},
+                                      {"role": "user", "content": user}]
+    ran = 0
+    for it in range(AGENT_MAX_ITERS):
+        try:
+            resp = client.chat.completions.create(
+                model=CHAT_MODEL, messages=messages, tools=TOOL_SPECS, tool_choice="auto",
+                max_tokens=300, temperature=0.2)
+            msg = resp.choices[0].message
+        except Exception as exc:
+            log.warning("agent call %d failed: %s", it + 1, exc)
+            if it == 0:
+                return None
+            box.trace.append({"tool": "muse-spark", "summary": "model call failed; stopped"})
+            break
+        calls = _tool_calls_of(msg)
+        if not calls:
+            if ran == 0:
+                _route_from_text(box, msg.content or "", command)
+            break
+        messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [
+            {"id": cid, "type": "function", "function": {"name": name, "arguments": json.dumps(args)}}
+            for cid, name, args in calls]})
+        for cid, name, args in calls:
+            result = box.run(name, args)
+            ran += 1
+            messages.append({"role": "tool", "tool_call_id": cid, "content": json.dumps(result)})
+    return box.output()
+
+
+def _route_from_text(box: Any, text: str, command: str) -> None:
+    """The model answered in prose: use a tool it named, else the keyword intent."""
+    from .skills import TOOL_MODE
+
+    named = [t for t in TOOL_MODE if t in text]
+    if named:
+        box.trace.append({"tool": "muse-spark", "summary": f"named {named[0]} in text"})
+        box.run(named[0], {})
+        return
+    intent = keyword_intent(command)
+    box.route(intent, f"model replied in text; keywords -> {intent}")
 
 
 # --------------------------------------------------------------------------- hints
