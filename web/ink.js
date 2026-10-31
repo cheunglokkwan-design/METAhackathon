@@ -1,5 +1,6 @@
 // Student ink: pen strokes, typed lines, eraser, undo and the page snapshot.
 // Everything is kept in page coordinates (CSS px of the unscaled 1000 x 1400 page).
+import { getStroke } from './vendor/perfect-freehand.js';   // vendored, MIT (web/vendor/perfect-freehand.LICENSE)
 
 export const PAGE_W = 1000, PAGE_H = 1400, RULE = 44, TOP = 132, MARGIN_X = 96;
 export const STUDENT_FONT = '"Patrick Hand", "Bradley Hand", "Segoe Print", cursive';
@@ -8,10 +9,8 @@ export const rowY = k => TOP + k * RULE;              // y of ruled line k
 export const baselineOf = k => rowY(k) - 8;           // text sits just above the rule
 export const rowAt = y => Math.max(0, Math.ceil((y - TOP) / RULE));
 
-let getStroke = null;
-const freehand = import('https://cdn.jsdelivr.net/npm/perfect-freehand@1.2.2/+esm')
-  .then(m => { getStroke = m.getStroke || m.default?.getStroke || m.default; })
-  .catch(() => console.info('[margin] perfect-freehand unavailable, using the built-in pen'));
+
+export const PEN_SIZES = { fine: 1.2, medium: 1.8, bold: 3 };
 
 const mctx = document.createElement('canvas').getContext('2d');
 const inBox = ([x, y, w, h], px, py, pad = 0) => px >= x - pad && px <= x + w + pad && py >= y - pad && py <= y + h + pad;
@@ -33,19 +32,13 @@ function outlineToPath(pts) {
   return new Path2D(d + 'Z');
 }
 
+// Pressure-shaped outline (Apple Pencil pressure; simulated from speed for mouse and finger).
 function strokeGeometry(s, last = true) {
-  if (getStroke) {
-    const outline = getStroke(s.pts, { size: s.size * 2, thinning: 0.6, smoothing: 0.55, streamline: 0.4, simulatePressure: s.sim, last });
-    return { path: outlineToPath(outline), fill: true };
-  }
-  const p = new Path2D(), pts = s.pts;               // fallback: smoothed polyline
-  p.moveTo(pts[0][0], pts[0][1]);
-  for (let i = 1; i < pts.length - 1; i++) p.quadraticCurveTo(pts[i][0], pts[i][1], (pts[i][0] + pts[i + 1][0]) / 2, (pts[i][1] + pts[i + 1][1]) / 2);
-  p.lineTo(pts.at(-1)[0], pts.at(-1)[1]);
-  return { path: p, fill: false };
+  const outline = getStroke(s.pts, { size: s.size * 2, thinning: 0.6, smoothing: 0.55, streamline: 0.4, simulatePressure: s.sim, last });
+  return { path: outlineToPath(outline), fill: true };
 }
 
-function paint(c, it) {
+export function paint(c, it) {
   c.fillStyle = c.strokeStyle = it.color;
   if (it.type === 'text') { c.font = `${TEXT_PX}px ${STUDENT_FONT}`; c.fillText(it.text, it.x, it.baseline); return; }
   if (it.fill) c.fill(it.path);
@@ -68,28 +61,62 @@ function inputBaseline() {
   return (36 - asc - desc) / 2 + asc;
 }
 
+// Adds the derived fields (outline path, bbox) to a stored item.
+export function prepareItem(it) {
+  if (it.type === 'stroke') {
+    Object.assign(it, strokeGeometry(it));
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const [x, y] of it.pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
+    const pad = it.size * 1.5;
+    it.bbox = [x0 - pad, y0 - pad, x1 - x0 + 2 * pad, y1 - y0 + 2 * pad];
+  } else {
+    mctx.font = `${TEXT_PX}px ${STUDENT_FONT}`;
+    it.bbox = [it.x, it.baseline - 24, Math.max(8, mctx.measureText(it.text).width), 32];
+  }
+  return it;
+}
+
+// Plain JSON for storage: no Path2D, rounded coordinates.
+const r2 = v => Math.round(v * 100) / 100;
+export function serializeItem(it) {
+  if (it.type === 'stroke') return { type: 'stroke', color: it.color, size: it.size, sim: !!it.sim, pts: it.pts.map(([x, y, p]) => [r2(x), r2(y), Math.round((p ?? 0.5) * 1000) / 1000]) };
+  return { type: 'text', text: it.text, x: it.x, row: it.row, baseline: it.baseline, color: it.color };
+}
+const cloneItem = it => ({ ...it, editing: false });
+
 export class Notebook {
-  constructor({ page, ink, live, scroller, onErase, onChange }) {
-    Object.assign(this, { page, ink, live, scroller, onErase, onChange });
-    this.items = []; this.history = [];
-    this.tool = 'pen'; this.color = '#1f3a7a'; this.size = 1.8; this.scale = 1;
+  // paper: optional canvas under the ink, painted by paintPaper(ctx, style) at the same resolution.
+  constructor({ page, ink, live, paper, paintPaper, scroller, onErase, onChange }) {
+    Object.assign(this, { page, ink, live, paper, paintPaper, scroller, onErase, onChange });
+    this.paperStyle = 'ruled';
+    this.items = []; this.history = []; this.future = [];
+    this.ext = null;                                  // { save, load }: extra state (Meta's ink) kept in undo snapshots
+    this.tool = 'pen'; this.color = '#1f3a7a'; this.size = PEN_SIZES.medium; this.scale = 1;
     this.lastPoint = { x: 320, y: 220 }; this.penSeen = false; this.active = null; this.cursor = null;
     this.ctx = ink.getContext('2d'); this.lctx = live.getContext('2d');
     for (const t of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel']) page.addEventListener(t, e => this[t](e));
     page.addEventListener('pointerleave', () => { if (!this.active) { this.cursor = null; this.renderLive(); } });
-    freehand.then(() => this.rebuild());
     document.fonts?.load(`${TEXT_PX}px "Patrick Hand"`).then(() => this.rebuild(), () => {});
   }
 
-  setScale(s) {
+  // Scale of the page on screen (used for hit-testing). The canvas backing store follows
+  // with setResolution, which zoom calls once a pinch settles.
+  setScale(s, { resolution = true } = {}) {
     this.scale = s;
+    if (resolution) this.setResolution(s);
+  }
+  setResolution(s) {
     const r = Math.min(3, (window.devicePixelRatio || 1) * s);
-    for (const c of [this.ink, this.live]) {
+    if (r === this.res) return;
+    this.res = r;
+    for (const c of [this.ink, this.live, this.paper].filter(Boolean)) {
       c.width = Math.round(PAGE_W * r); c.height = Math.round(PAGE_H * r);
       c.getContext('2d').setTransform(r, 0, 0, r, 0, 0);
     }
-    this.redraw(); this.renderLive();
+    this.redraw(); this.renderLive(); this.renderPaper();
   }
+  setPaper(style) { this.paperStyle = style; this.renderPaper(); }
+  renderPaper() { if (this.paper && this.paintPaper) this.paintPaper(this.paper.getContext('2d'), this.paperStyle); }
 
   setTool(t) { if (t !== 'type') this.commitInput(); this.tool = t; this.cursor = null; this.renderLive(); }
   setColor(c) { this.color = c; if (this.input) this.input.el.style.color = c; }
@@ -105,20 +132,19 @@ export class Notebook {
     if (e.pointerType === 'mouse' && e.button !== 0) return;
     if (e.pointerType === 'pen') this.penSeen = true;
     e.preventDefault();
-    if (e.pointerType === 'touch' && this.penSeen) { this.active = { id: e.pointerId, scrollY: e.clientY }; return; } // fingers scroll once a stylus is used
+    if (this.active) return;                          // one drawing pointer at a time (fingers pan once a stylus is used, see zoom.js)
     const pt = this.pos(e);
     if (this.tool === 'type') { this.openInput(pt); return; }
     this.commitInput();
     this.page.setPointerCapture?.(e.pointerId);
     this.active = { id: e.pointerId };
     if (this.tool === 'pen') this.cur = { type: 'stroke', color: this.color, size: this.size, sim: e.pointerType !== 'pen', pts: [[pt.x, pt.y, pt.p]] };
-    else { this.erased = []; this.eraseAt(pt); }
+    else { this.pending = this.snap(); this.erasedAny = false; this.eraseAt(pt); }
     this.cursor = pt; this.renderLive();
   }
 
   pointermove(e) {
     const a = this.active;
-    if (a && e.pointerId === a.id && a.scrollY != null) { this.scroller.scrollTop += a.scrollY - e.clientY; a.scrollY = e.clientY; return; }
     if (!a || e.pointerId !== a.id) {
       if (e.pointerType !== 'touch' && this.tool === 'eraser') { this.cursor = this.pos(e); this.renderLive(); }
       return;
@@ -138,45 +164,38 @@ export class Notebook {
     if (this.cur) {
       const s = this.cur; this.cur = null;
       if (s.pts.length === 1) s.pts.push([s.pts[0][0] + 0.4, s.pts[0][1] + 0.4, s.pts[0][2]]);
-      this.prepare(s); this.items.push(s);
-      this.push(() => this.remove(s));
+      this.prepare(s);
+      this.checkpoint(); this.items.push(s);
       const [x, y] = s.pts.at(-1); this.lastPoint = { x, y };
       this.redraw(); this.onChange?.('stroke');
-    } else if (this.erased?.length) {
-      const undo = this.erased.reverse(); this.push(() => undo.forEach(f => f())); this.onChange?.('erase');
-    }
-    this.erased = null;
+    } else if (this.erasedAny) this.onChange?.('erase');
+    this.pending = null; this.erasedAny = false;
     if (e.pointerType !== 'mouse') this.cursor = null;
     this.renderLive();
   }
   pointercancel(e) { this.pointerup(e); }
 
+  // A second finger arrived: drop the half-drawn stroke, the gesture is a pinch.
+  cancelActive() {
+    if (!this.active) return;
+    this.active = null; this.cur = null; this.cursor = null;
+    if (this.erasedAny) this.onChange?.('erase');
+    this.pending = null; this.erasedAny = false;
+    this.renderLive();
+  }
+
   eraseAt(pt) {
     const R = 10;
-    let dirty = false;
-    for (let i = this.items.length - 1; i >= 0; i--) {
-      const it = this.items[i];
-      if (!hits(it, pt, R)) continue;
-      this.items.splice(i, 1); this.erased.push(() => this.items.splice(i, 0, it)); dirty = true;
-    }
-    const u = this.onErase?.(pt, R);
-    if (u) this.erased.push(u);
+    const before = this.items.length;
+    this.items = this.items.filter(it => !hits(it, pt, R));
+    const dirty = this.items.length !== before;
+    const metaHit = this.onErase?.(pt, R);
+    if ((dirty || metaHit) && !this.erasedAny && this.pending) { this.history.push(this.pending); this.future = []; this.erasedAny = true; }
     if (dirty) this.redraw();
   }
 
   // ---- model ---------------------------------------------------------------
-  prepare(it) {
-    if (it.type === 'stroke') {
-      Object.assign(it, strokeGeometry(it));
-      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
-      for (const [x, y] of it.pts) { x0 = Math.min(x0, x); y0 = Math.min(y0, y); x1 = Math.max(x1, x); y1 = Math.max(y1, y); }
-      const pad = it.size * 1.5;
-      it.bbox = [x0 - pad, y0 - pad, x1 - x0 + 2 * pad, y1 - y0 + 2 * pad];
-    } else {
-      mctx.font = `${TEXT_PX}px ${STUDENT_FONT}`;
-      it.bbox = [it.x, it.baseline - 24, Math.max(8, mctx.measureText(it.text).width), 32];
-    }
-  }
+  prepare(it) { return prepareItem(it); }
   rebuild() { this.items.forEach(it => this.prepare(it)); this.redraw(); }
   redraw() {
     this.ctx.clearRect(0, 0, PAGE_W, PAGE_H);
@@ -193,22 +212,47 @@ export class Notebook {
     }
   }
 
-  push(undo) { this.history.push(undo); if (this.history.length > 300) this.history.shift(); }
-  mergeLast(n) { const fns = this.history.splice(-n, n); if (fns.length) this.push(() => fns.reverse().forEach(f => f())); }
+  // ---- undo / redo: whole-page snapshots (student ink + Meta's ink) ----------
+  snap() { return { items: this.items.map(cloneItem), ext: this.ext?.save() }; }
+  restore(s) { this.items = s.items.map(cloneItem); this.ext?.load(s.ext); this.redraw(); }
+  checkpoint() {
+    this.history.push(this.snap());
+    if (this.history.length > 200) this.history.shift();
+    this.future = [];
+  }
   undo() {
     this.commitInput();
-    const u = this.history.pop();
-    if (u) { u(); this.redraw(); this.onChange?.('undo'); }
-    return !!u;
+    const s = this.history.pop();
+    if (!s) return false;
+    this.future.push(this.snap()); this.restore(s); this.onChange?.('undo');
+    return true;
+  }
+  redo() {
+    this.commitInput();
+    const s = this.future.pop();
+    if (!s) return false;
+    this.history.push(this.snap()); this.restore(s); this.onChange?.('redo');
+    return true;
   }
   remove(it) { const i = this.items.indexOf(it); if (i >= 0) this.items.splice(i, 1); }
   clear() {
     this.commitInput();
     if (!this.items.length) return false;
-    const old = this.items; this.items = [];
-    this.push(() => { this.items = old; });
+    this.items = [];
     this.redraw(); return true;
   }
+
+  // ---- pages ------------------------------------------------------------------
+  // Swap in another page's items and its undo history ({ history, future } arrays, kept by the caller).
+  load(items, hist) {
+    this.cancelActive();
+    if (this.input) { this.input.el.remove(); this.input = null; }
+    this.items = items.map(it => prepareItem({ ...it }));
+    this.history = hist.history; this.future = hist.future;
+    this.lastPoint = { x: 320, y: 220 };
+    this.redraw(); this.renderLive();
+  }
+  serialize() { return this.items.map(serializeItem); }
 
   // ---- typed lines -----------------------------------------------------------
   addText(text, x, row, color = this.color) {
@@ -260,11 +304,11 @@ export class Notebook {
     s.el.remove();
     if (orig) {
       orig.editing = false;
-      if (!v) { const i = this.items.indexOf(orig); this.remove(orig); this.push(() => this.items.splice(i, 0, orig)); }
-      else if (v !== orig.text) { const old = orig.text; orig.text = v; this.prepare(orig); this.push(() => { orig.text = old; this.prepare(orig); }); }
+      if (!v) { this.checkpoint(); this.remove(orig); }
+      else if (v !== orig.text) { this.checkpoint(); orig.text = v; this.prepare(orig); }
     } else if (v) {
+      this.checkpoint();
       const it = this.addText(v, s.x, s.row);
-      this.push(() => this.remove(it));
       this.lastPoint = { x: it.bbox[0] + it.bbox[2], y: it.bbox[1] };
     }
     this.redraw();

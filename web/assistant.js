@@ -37,6 +37,43 @@ function wrap(text, px, maxW) {
   return out;
 }
 
+// Finished markup of a mark: no clip paths (they live in <defs>), no nib, no half-drawn dashes.
+function cleanMarkup(g) {
+  const c = g.cloneNode(true);
+  c.querySelectorAll('.nib, rect.hit').forEach(n => n.remove());
+  c.querySelectorAll('[clip-path]').forEach(n => n.removeAttribute('clip-path'));
+  c.querySelectorAll('.ink-stroke').forEach(n => n.removeAttribute('style'));
+  return c.innerHTML;
+}
+
+// Paints Meta's ink onto a 2D canvas (PNG/PDF export, thumbnails). `marks` is serialized data.
+export const META_COLOR = '#d0452b';
+export function paintMeta(ctx, marks = []) {
+  const root = document.createElementNS(NS, 'svg');
+  for (const d of marks) {
+    const g = svgEl('g', {}, root);
+    g.innerHTML = d.html;
+    const ghost = d.kind === 'ghost';
+    for (const p of g.querySelectorAll('path.ink-stroke')) {
+      ctx.save();
+      ctx.globalAlpha = 0.92; ctx.strokeStyle = META_COLOR; ctx.lineCap = ctx.lineJoin = 'round';
+      ctx.lineWidth = +p.getAttribute('stroke-width') || 2.4;
+      ctx.stroke(new Path2D(p.getAttribute('d')));
+      ctx.restore();
+    }
+    for (const t of g.querySelectorAll('text')) {
+      ctx.save();
+      const x = +t.getAttribute('x'), y = +t.getAttribute('y');
+      const rot = /rotate\(([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\)/.exec(t.parentNode.getAttribute?.('transform') || '');
+      if (rot) { ctx.translate(+rot[2], +rot[3]); ctx.rotate(+rot[1] * Math.PI / 180); ctx.translate(-rot[2], -rot[3]); }
+      if (t.classList.contains('read-label')) { ctx.font = '500 10.5px Inter, sans-serif'; ctx.fillStyle = '#9aa3ad'; }
+      else { ctx.font = `600 ${t.getAttribute('font-size') || 30}px ${FONT}, cursive`; ctx.fillStyle = META_COLOR; ctx.globalAlpha = ghost ? 0.32 : 1; }
+      ctx.fillText(t.textContent, x, y);
+      ctx.restore();
+    }
+  }
+}
+
 export async function assist(payload, timeoutMs = 45000) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
@@ -62,19 +99,57 @@ export class MetaInk {
     this.marks.push(m);
     return m;
   }
+  // record: take an undo snapshot first (the student cleared Meta's ink on purpose).
   clear(record = false) {
+    if (record && this.marks.length) this.nb.checkpoint();
     this.run++;
     const gone = this.marks;
     this.marks = [];
     for (const m of gone) { m.g.classList.add('fade'); m.t = setTimeout(() => m.g.remove(), 380); }
-    if (record && gone.length) this.nb.push(() => gone.forEach(m => { clearTimeout(m.t); m.g.classList.remove('fade'); this.svg.append(m.g); this.marks.push(m); }));
     return gone.length;
   }
   erase({ x, y }, R) {
     const hit = this.marks.filter(m => m.boxes.some(b => inBox(b, x, y, R / 2)) || m.pts.some(([px, py]) => Math.hypot(px - x, py - y) < R + 3));
-    if (!hit.length) return null;
     for (const m of hit) { m.g.remove(); this.marks.splice(this.marks.indexOf(m), 1); }
-    return () => hit.forEach(m => { this.svg.append(m.g); this.marks.push(m); });
+    return hit.length > 0;
+  }
+
+  // ---- undo snapshots (see Notebook.ext) -----------------------------------------
+  save() { return this.marks.slice(); }
+  load(list = []) {
+    this.run++;
+    for (const m of this.marks) if (!list.includes(m)) m.g.remove();
+    for (const m of list) { clearTimeout(m.t); m.g.classList.remove('fade'); this.svg.append(m.g); }
+    this.marks = [...list];
+  }
+
+  // ---- persistence: marks as plain JSON (finished SVG markup + hit boxes) ----------
+  serialize() {
+    return this.marks.map(m => ({ kind: m.kind, html: cleanMarkup(m.g), boxes: m.boxes, pts: m.pts.map(([x, y]) => [Math.round(x), Math.round(y)]), note: m.note || null }));
+  }
+  // Replace the layer with stored marks (switching pages, reload). Drops everything in flight.
+  restore(data = []) {
+    this.run++;
+    for (const m of this.marks) { clearTimeout(m.t); m.g.remove(); }
+    this.svg.querySelectorAll('g.mark').forEach(g => g.remove());
+    this.defs.replaceChildren();
+    this.marks = [];
+    for (const d of data || []) {
+      const m = this.mark(d.kind);
+      m.g.innerHTML = d.html;
+      m.boxes = d.boxes || []; m.pts = d.pts || []; m.note = d.note || null;
+      if (m.note) this.makeTappable(m);
+    }
+  }
+  makeTappable(m) {
+    if (!this.onNoteTap || m.g.classList.contains('tap-target')) return;
+    m.g.classList.add('tap-target');
+    m.g.setAttribute('role', 'button');
+    if (!m.g.querySelector('rect.hit') && m.boxes.length) {
+      const pad = 6, xs = m.boxes.map(q => q[0]), ys = m.boxes.map(q => q[1]);
+      svgEl('rect', { class: 'hit', x: Math.min(...xs) - pad, y: Math.min(...ys) - pad, width: Math.max(...m.boxes.map(q => q[0] + q[2])) - Math.min(...xs) + 2 * pad, height: Math.max(...m.boxes.map(q => q[1] + q[3])) - Math.min(...ys) + 2 * pad, rx: 8 }, m.g);
+    }
+    m.g.addEventListener('click', () => this.onNoteTap(m.note));
   }
   metaBoxes() { return this.marks.flatMap(m => m.boxes); }
   isFree(box) { return !this.nb.occupied(box) && !this.metaBoxes().some(b => overlap(b, box)); }
@@ -240,13 +315,8 @@ export class MetaInk {
     const arr = this.arrow(from, to, ctrl);
     await this.stroke(m, arr.pts, arr.d, 320, token, 2.2);
     for (let i = 0; i < lines.length && token === this.run; i++) await this.write(m, lines[i], x, bases[i], px, token);
-    if (this.onNoteTap) {                            // tap a hint to get a more specific one
-      m.g.classList.add('tap-target');
-      m.g.setAttribute('role', 'button');
-      const pad = 6, xs = m.boxes.map(q => q[0]), ys = m.boxes.map(q => q[1]);
-      svgEl('rect', { class: 'hit', x: Math.min(...xs) - pad, y: Math.min(...ys) - pad, width: Math.max(...m.boxes.map(q => q[0] + q[2])) - Math.min(...xs) + 2 * pad, height: Math.max(...m.boxes.map(q => q[1] + q[3])) - Math.min(...ys) + 2 * pad, rx: 8 }, m.g);
-      m.g.addEventListener('click', () => this.onNoteTap(a));
-    }
+    m.note = { kind: 'note', target: a.target ?? null, text: a.text };
+    this.makeTappable(m);                            // tap a hint to get a more specific one
   }
 
   async a_write(a, token, ghost = false) {
