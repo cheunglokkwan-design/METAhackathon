@@ -61,6 +61,12 @@ cp .env.example .env        # put your MODEL_API_KEY from https://dev.meta.ai in
 Without `MODEL_API_KEY` it runs in **offline mode**: typed lines (T tool) are checked and hints
 come from rules; handwriting can only be read with the key.
 
+## Put it online (free https, needed for voice on iPad)
+
+Hugging Face Spaces: create a Space with the **Docker** SDK, push this repo to it, and add
+`MODEL_API_KEY` under Settings → Variables and secrets (as a secret). The Dockerfile serves on port 7860.
+Render also works: New Web Service → this repo → Docker, and add `MODEL_API_KEY` as an environment variable.
+
 ## Limitations (MVP)
 
 - Lives in its own web notebook, not inside GoodNotes/Notability (no plugin APIs). OneNote add-in
