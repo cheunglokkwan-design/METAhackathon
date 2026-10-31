@@ -36,6 +36,11 @@ pen strokes / typed lines ──► Muse Spark 1.3 reads the page into math line
 
 ## Run it
 
+One command: `./start.sh` (Mac/Linux) or double-click `start.bat` (Windows), then open http://localhost:8000.
+Put your `MODEL_API_KEY` in `.env` to turn on handwriting reading.
+
+Manual:
+
 ```bash
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env        # put your MODEL_API_KEY from https://dev.meta.ai in it
