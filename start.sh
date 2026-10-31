@@ -6,4 +6,4 @@ cd "$(dirname "$0")"
 .venv/bin/pip install -q -r requirements.txt
 [ -f .env ] || cp .env.example .env
 echo "Margin running at http://localhost:8000"
-exec .venv/bin/uvicorn server.app:app --port 8000
+exec .venv/bin/uvicorn server.app:app --host 0.0.0.0 --port 8000

@@ -10,6 +10,15 @@ next line. Say "just give me the answer" and it writes out the rest of the worki
 
 No chat box: everything the assistant says is ink on the page.
 
+**The notebook:** a shelf of notebooks, pages with thumbnails, pressure-sensitive pen (Apple Pencil),
+highlighter, lasso, movable text boxes, photos and PDF pages, pinch zoom, autosave, PNG/PDF export,
+and it installs on the iPad home screen (Safari → Share → Add to Home Screen) and works offline.
+
+**What Meta can do on the page:** hints (3 levels, then a faint "ghost" of the next line), check my work,
+just give me the answer, tidy my writing into typed maths, and sketch the graph. Covers indefinite and
+definite integrals and derivatives (product rule, chain rule). Muse Spark 1.3 runs as a tool-calling
+agent; every piece of maths it writes comes from the SymPy referee.
+
 ![Margin catching a sign slip](docs/screenshot.png)
 
 ## How it works
@@ -46,16 +55,22 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env        # put your MODEL_API_KEY from https://dev.meta.ai in it
 .venv/bin/uvicorn server.app:app --reload
 # open http://localhost:8000  (⋯ menu → "Try the demo problem", then press / → Help me)
-.venv/bin/pytest -q         # 47 tests, offline
+.venv/bin/pytest -q         # 129 tests, offline
 ```
 
 Without `MODEL_API_KEY` it runs in **offline mode**: typed lines (T tool) are checked and hints
 come from rules; handwriting can only be read with the key.
+
+## Put it online (free https, needed for voice on iPad)
+
+Hugging Face Spaces: create a Space with the **Docker** SDK, push this repo to it, and add
+`MODEL_API_KEY` under Settings → Variables and secrets (as a secret). The Dockerfile serves on port 7860.
+Render also works: New Web Service → this repo → Docker, and add `MODEL_API_KEY` as an environment variable.
 
 ## Limitations (MVP)
 
 - Lives in its own web notebook, not inside GoodNotes/Notability (no plugin APIs). OneNote add-in
   or a Xournal++ plugin are the realistic routes into a real app.
 - The live Meta API path (page reading, hint wording, transcription) has not been run yet: needs a key.
-- Scope: indefinite integrals (power rule, u-substitution, by parts). No definite integrals or d/dx problems yet.
-- Voice wake word needs Chrome; not tested on a real iPad / Apple Pencil. Pages are not saved on reload.
+- Maths scope: first-year integrals and derivatives; quotient-rule mistakes get only a generic hint.
+- Voice wake word needs Chrome; not tested on a real iPad / Apple Pencil. Notebooks are saved in the browser on one device (no accounts or sync).

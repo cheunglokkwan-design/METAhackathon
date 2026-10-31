@@ -3,12 +3,19 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
-  <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="theme-color" content="#f4f1ea">
+  <meta name="description" content="A paper notebook for maths, with Meta writing hints in the margin.">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="Margin">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" type="image/png" sizes="32x32" href="icons/favicon-32.png">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
   <title>Margin</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;600&family=Patrick+Hand&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Caveat:wght@500;600&family=Patrick+Hand&family=Inter:wght@400;500;600&family=STIX+Two+Text:ital,wght@0,400;1,400&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="styles.css">
   <script type="module" src="app.js"></script>
 </head>
@@ -20,25 +27,78 @@
     <symbol id="i-undo" viewBox="0 0 24 24"><path d="M9 14L4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/></symbol>
     <symbol id="i-trash" viewBox="0 0 24 24"><path d="M4 7h16"/><path d="M9 7V4.5h6V7"/><path d="M6.5 7l1 13h9l1-13"/></symbol>
     <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/></symbol>
+    <symbol id="i-redo" viewBox="0 0 24 24"><path d="M15 14l5-5-5-5"/><path d="M20 9H9.5a5.5 5.5 0 0 0 0 11H13"/></symbol>
+    <symbol id="i-shelf" viewBox="0 0 24 24"><rect x="4" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="4" width="6.5" height="6.5" rx="1.5"/><rect x="4" y="13.5" width="6.5" height="6.5" rx="1.5"/><rect x="13.5" y="13.5" width="6.5" height="6.5" rx="1.5"/></symbol>
+    <symbol id="i-sidebar" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M9.5 4.5v15"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+    <symbol id="i-up" viewBox="0 0 24 24"><path d="M6 14l6-6 6 6"/></symbol>
+    <symbol id="i-down" viewBox="0 0 24 24"><path d="M6 10l6 6 6-6"/></symbol>
+    <symbol id="i-left" viewBox="0 0 24 24"><path d="M14.5 6l-6 6 6 6"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
+    <symbol id="i-hl" viewBox="0 0 24 24"><path d="M9.2 14.8l-3.5 3.5H3.5"/><path d="M7.4 12.6l4 4"/><path d="M7.4 12.6L15.6 4.4a2 2 0 0 1 2.8 0l1.2 1.2a2 2 0 0 1 0 2.8l-8.2 8.2"/><path d="M14 20.5h6.5" stroke-width="2.4"/></symbol>
+    <symbol id="i-lasso" viewBox="0 0 24 24"><path d="M12 4c4.4 0 8 2.3 8 5.3s-3.6 5.3-8 5.3-8-2.3-8-5.3S7.6 4 12 4z" stroke-dasharray="2.6 2.4"/><path d="M7.6 13.8c-1.6 1.2-1.4 2.9.3 3.5 1.6.6 1.4 2.3-.4 3.2"/></symbol>
+    <symbol id="i-image" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2.5"/><circle cx="9" cy="10" r="1.6"/><path d="M20.5 15.5l-4.5-4.5-8 8"/></symbol>
     <symbol id="i-mic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><path d="M12 17.5V21"/></symbol>
   </svg>
 
-  <header class="toolbar">
-    <div class="brand"><span class="mark-logo"></span><b>Margin</b><span class="crumb">Calculus · Page 1</span></div>
+  <section id="shelf" class="shelf" hidden>
+    <header class="shelf-head">
+      <div class="brand big"><span class="mark-logo"></span><b>Margin</b></div>
+      <button id="new-notebook" class="pill-btn"><svg><use href="#i-plus"/></svg><span>New notebook</span></button>
+    </header>
+    <h1>Notebooks</h1>
+    <div class="shelf-grid"></div>
+    <p class="shelf-foot" id="storage-note"></p>
+  </section>
 
-    <div class="tools" role="toolbar" aria-label="Pen tools">
-      <div class="seg">
-        <button data-tool="pen" aria-pressed="true" title="Pen (P)"><svg><use href="#i-pen"/></svg></button>
-        <button data-tool="eraser" aria-pressed="false" title="Eraser (E)"><svg><use href="#i-eraser"/></svg></button>
-        <button data-tool="type" aria-pressed="false" title="Type a line (T)"><svg><use href="#i-type"/></svg></button>
+  <header class="toolbar">
+    <div class="brand">
+      <button id="to-shelf" class="icon" title="All notebooks"><svg><use href="#i-shelf"/></svg></button>
+      <button id="toggle-pages" class="icon" title="Show pages" aria-pressed="true"><svg><use href="#i-sidebar"/></svg></button>
+      <span class="crumb"><b id="nb-title">Calculus</b><span class="pager">
+        <button id="prev-page" class="icon tiny" title="Previous page (PgUp)"><svg><use href="#i-left"/></svg></button>
+        <span id="page-num">1 / 1</span>
+        <button id="next-page" class="icon tiny" title="Next page (PgDn)"><svg><use href="#i-right"/></svg></button>
+      </span></span>
+    </div>
+
+    <div class="tools" role="toolbar" aria-label="Pen tools" data-tool="pen">
+      <div class="seg tool-seg">
+        <button data-tool="pen" aria-pressed="true" title="Pen (P)" aria-label="Pen"><svg><use href="#i-pen"/></svg></button>
+        <button data-tool="highlighter" aria-pressed="false" title="Highlighter (H)" aria-label="Highlighter"><svg><use href="#i-hl"/></svg></button>
+        <button data-tool="eraser" aria-pressed="false" title="Eraser (E)" aria-label="Eraser"><svg><use href="#i-eraser"/></svg></button>
+        <button data-tool="lasso" aria-pressed="false" title="Lasso: circle things to move, recolour or delete (L)" aria-label="Lasso"><svg><use href="#i-lasso"/></svg></button>
+        <button data-tool="type" aria-pressed="false" title="Text box (T)" aria-label="Text box"><svg><use href="#i-type"/></svg></button>
       </div>
-      <div class="swatches">
+      <div class="seg img-seg">
+        <div class="img-wrap">
+          <button id="img-btn" title="Pictures and PDFs" aria-label="Pictures and PDFs" aria-haspopup="true" aria-expanded="false"><svg><use href="#i-image"/></svg></button>
+          <div id="img-menu" class="menu img-menu" hidden>
+            <button data-img="insert"><b>Insert image</b><small>A photo or picture you can move and resize</small></button>
+            <button data-img="page"><b>New page from PDF or photo</b><small>Write on top of a worksheet</small></button>
+          </div>
+        </div>
+      </div>
+      <div class="swatches hl" role="group" aria-label="Highlighter colour">
+        <button data-color="#ffd426" aria-pressed="true" title="Yellow highlighter" style="--c:#ffd426"></button>
+        <button data-color="#7fe07a" aria-pressed="false" title="Green highlighter" style="--c:#7fe07a"></button>
+        <button data-color="#ff86c3" aria-pressed="false" title="Pink highlighter" style="--c:#ff86c3"></button>
+      </div>
+      <div class="swatches pen" role="group" aria-label="Ink colour">
         <button data-color="#1f3a7a" aria-pressed="true" title="Blue ink" style="--c:#1f3a7a"></button>
-        <button data-color="#26262b" aria-pressed="false" title="Graphite" style="--c:#26262b"></button>
+        <button data-color="#26262b" aria-pressed="false" title="Black ink" style="--c:#26262b"></button>
         <button data-color="#1e6a4f" aria-pressed="false" title="Green ink" style="--c:#1e6a4f"></button>
+        <button data-color="#6a3d9a" aria-pressed="false" title="Purple ink" style="--c:#6a3d9a"></button>
+        <button data-color="#0f7c8c" aria-pressed="false" title="Teal ink" style="--c:#0f7c8c"></button>
+      </div>
+      <div class="seg sizes" role="group" aria-label="Pen width">
+        <button data-size="fine" aria-pressed="false" title="Fine pen"><i style="--d:3px"></i></button>
+        <button data-size="medium" aria-pressed="true" title="Medium pen"><i style="--d:5px"></i></button>
+        <button data-size="bold" aria-pressed="false" title="Bold pen"><i style="--d:8px"></i></button>
       </div>
       <div class="seg plain">
         <button id="undo" title="Undo (⌘Z)"><svg><use href="#i-undo"/></svg></button>
+        <button id="redo" title="Redo (⇧⌘Z)"><svg><use href="#i-redo"/></svg></button>
         <button id="clear" title="Clear page"><svg><use href="#i-trash"/></svg></button>
       </div>
     </div>
@@ -53,26 +113,57 @@
           <button data-act="hide-meta">Hide Meta’s ink</button>
           <button data-act="clear-meta">Clear Meta’s ink <kbd>Esc</kbd></button>
           <hr>
-          <div class="keys"><span><kbd>/</kbd> ask Meta</span><span><kbd>P</kbd> pen</span><span><kbd>E</kbd> eraser</span><span><kbd>T</kbd> type</span></div>
+          <div class="menu-row"><span>Paper</span><div class="seg mini" id="paper-seg">
+            <button data-paper="ruled" aria-pressed="true">Ruled</button><button data-paper="grid" aria-pressed="false">Grid</button><button data-paper="blank" aria-pressed="false">Blank</button>
+          </div></div>
+          <div class="menu-row"><span>Zoom</span><div class="seg mini">
+            <button data-act="zoom-out" title="Zoom out (⌘−)">−</button><button data-act="zoom-reset" id="zoom-label" title="Fit width (⌘0)">100%</button><button data-act="zoom-in" title="Zoom in (⌘+)">+</button>
+          </div></div>
+          <hr>
+          <button data-act="export-png">Export page as PNG</button>
+          <button data-act="export-pdf">Export notebook as PDF</button>
+          <hr>
+          <div class="keys"><span><kbd>/</kbd> ask Meta</span><span><kbd>P</kbd> pen</span><span><kbd>E</kbd> eraser</span><span><kbd>H</kbd> highlighter</span><span><kbd>L</kbd> lasso</span><span><kbd>T</kbd> text</span><span><kbd>PgDn</kbd> next page</span></div>
           <div id="status" class="status">Checking connection…</div>
         </div>
       </div>
     </div>
   </header>
 
-  <main id="desk" class="desk">
-    <div id="sheet" class="sheet">
-      <div id="page" class="page" data-tool="pen">
-        <div class="paper-head"><span>Calculus</span><span>Date ____________</span></div>
-        <canvas id="ink"></canvas>
-        <svg id="meta" class="meta-layer"></svg>
-        <canvas id="live"></canvas>
-        <div id="reading" class="reading" hidden><i></i><span>Meta is reading your page…</span></div>
+  <div class="work">
+    <aside id="pages" class="pages" aria-label="Pages">
+      <div class="pages-head"><span>Pages</span><button id="add-page" class="icon tiny" title="Add page" aria-label="Add page"><svg><use href="#i-plus"/></svg></button></div>
+      <div class="thumbs"></div>
+    </aside>
+    <main id="desk" class="desk">
+      <div id="sheet" class="sheet">
+        <div id="page" class="page" data-tool="pen" data-paper="ruled">
+          <canvas id="paper"></canvas>
+          <div class="paper-head"><span id="paper-title">Calculus</span><span>Date ____________</span></div>
+          <canvas id="ink"></canvas>
+          <svg id="meta" class="meta-layer"></svg>
+          <canvas id="live"></canvas>
+          <div id="sel-bar" class="sel-bar" hidden>
+            <div class="sel-dots pen">
+              <button data-recolor="#1f3a7a" style="--c:#1f3a7a" title="Blue" aria-label="Blue"></button><button data-recolor="#26262b" style="--c:#26262b" title="Black" aria-label="Black"></button><button data-recolor="#1e6a4f" style="--c:#1e6a4f" title="Green" aria-label="Green"></button><button data-recolor="#6a3d9a" style="--c:#6a3d9a" title="Purple" aria-label="Purple"></button><button data-recolor="#0f7c8c" style="--c:#0f7c8c" title="Teal" aria-label="Teal"></button><button data-recolor="#c4321f" style="--c:#c4321f" title="Red" aria-label="Red"></button>
+            </div>
+            <div class="sel-dots hl">
+              <button data-recolor="#ffd426" style="--c:#ffd426" title="Yellow highlight" aria-label="Yellow highlight"></button><button data-recolor="#7fe07a" style="--c:#7fe07a" title="Green highlight" aria-label="Green highlight"></button><button data-recolor="#ff86c3" style="--c:#ff86c3" title="Pink highlight" aria-label="Pink highlight"></button>
+            </div>
+            <button data-sel="delete" class="sel-del" title="Delete (⌫)"><svg><use href="#i-trash"/></svg><span>Delete</span></button>
+          </div>
+          <div id="reading" class="reading" hidden><i></i><span>Meta is reading your page…</span></div>
+        </div>
       </div>
-    </div>
-  </main>
+      <button id="zoom-pill" class="zoom-pill" hidden title="Back to fit width">100%</button>
+    </main>
+  </div>
 
   <div id="coach" class="coach">Write with the pen, or press <kbd>T</kbd> to type a line. Then press <kbd>/</kbd> or tap <b>Hey Meta</b>.</div>
+
+  <div id="trace" class="trace" hidden aria-live="polite"></div>
+  <input id="pick-image" type="file" accept="image/*" hidden>
+  <input id="pick-page" type="file" accept="image/*,application/pdf,.pdf" hidden>
 
   <button id="mic" class="mic" data-state="idle" title="Hey Meta (tap to speak)">
     <span class="orb"><svg><use href="#i-mic"/></svg></span><span class="label">Hey Meta</span><kbd class="hint">/</kbd>
@@ -88,9 +179,12 @@
       <button data-mode="hint" data-say="help me">Help me</button>
       <button data-mode="check" data-say="check my work">Check my work</button>
       <button data-mode="answer" data-say="just give me the answer">Just give me the answer</button>
+      <button data-mode="typeset" data-say="tidy my writing">Tidy my writing</button>
+      <button data-mode="graph" data-say="sketch the graph">Sketch the graph</button>
     </div>
   </div>
 
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="modal" class="modal" hidden></div>
 </body>
 </html>
