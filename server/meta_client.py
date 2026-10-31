@@ -7,10 +7,13 @@ MODEL_API_KEY or the API call fails (offline mode).
 
 from __future__ import annotations
 
+from collections import deque
 import json
 import logging
 import os
 import re
+import threading
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -26,6 +29,140 @@ INTENTS = ("hint", "answer", "check")
 
 class OfflineError(RuntimeError):
     """Raised when a feature has no offline fallback (e.g. audio transcription)."""
+
+
+class RateLimiter:
+    """Thread-safe sliding-window rate limiter for outbound Meta API calls."""
+
+    def __init__(self, max_calls: int | None = None, period: float | None = None) -> None:
+        self._max_calls = max_calls
+        self._period = period
+        self._timestamps: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    @property
+    def max_calls(self) -> int:
+        if self._max_calls is not None:
+            return self._max_calls
+        return int(os.getenv("META_RATE_LIMIT_CALLS", "30"))
+
+    @property
+    def period(self) -> float:
+        if self._period is not None:
+            return self._period
+        return float(os.getenv("META_RATE_LIMIT_PERIOD", "60.0"))
+
+    def allow(self) -> bool:
+        max_calls = self.max_calls
+        period = self.period
+        if max_calls <= 0:
+            return False
+        now = time.monotonic()
+        with self._lock:
+            cutoff = now - period
+            while self._timestamps and self._timestamps[0] <= cutoff:
+                self._timestamps.popleft()
+            if len(self._timestamps) >= max_calls:
+                return False
+            self._timestamps.append(now)
+            return True
+
+    def reset(self) -> None:
+        with self._lock:
+            self._timestamps.clear()
+
+
+class CircuitBreaker:
+    """Thread-safe circuit breaker (closed -> open -> half_open -> closed)."""
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(
+        self,
+        failure_threshold: int | None = None,
+        recovery_timeout: float | None = None,
+    ) -> None:
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout = recovery_timeout
+        self._state = self.CLOSED
+        self._failure_count = 0
+        self._opened_at: float = 0.0
+        self._half_open_in_flight = False
+        self._lock = threading.Lock()
+
+    @property
+    def failure_threshold(self) -> int:
+        if self._failure_threshold is not None:
+            return self._failure_threshold
+        return max(1, int(os.getenv("META_CB_FAILURE_THRESHOLD", "3")))
+
+    @property
+    def recovery_timeout(self) -> float:
+        if self._recovery_timeout is not None:
+            return self._recovery_timeout
+        return float(os.getenv("META_CB_RECOVERY_TIMEOUT", "60.0"))
+
+    @property
+    def state(self) -> str:
+        with self._lock:
+            if self._state == self.OPEN and (time.monotonic() - self._opened_at) >= self.recovery_timeout:
+                return self.HALF_OPEN
+            return self._state
+
+    @property
+    def failure_count(self) -> int:
+        with self._lock:
+            return self._failure_count
+
+    def allow_request(self) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            if self._state == self.CLOSED:
+                return True
+            if self._state == self.OPEN:
+                if (now - self._opened_at) >= self.recovery_timeout:
+                    self._state = self.HALF_OPEN
+                    self._half_open_in_flight = True
+                    return True
+                return False
+            if not self._half_open_in_flight:
+                self._half_open_in_flight = True
+                return True
+            return False
+
+    def cancel_probe(self) -> None:
+        """Release the half-open probe slot if a request is rejected before calling upstream."""
+        with self._lock:
+            if self._state == self.HALF_OPEN:
+                self._half_open_in_flight = False
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failure_count = 0
+            self._state = self.CLOSED
+            self._half_open_in_flight = False
+
+    def record_failure(self) -> None:
+        now = time.monotonic()
+        with self._lock:
+            self._failure_count += 1
+            if self._state == self.HALF_OPEN or self._failure_count >= self.failure_threshold:
+                self._state = self.OPEN
+                self._opened_at = now
+                self._half_open_in_flight = False
+
+    def reset(self) -> None:
+        with self._lock:
+            self._state = self.CLOSED
+            self._failure_count = 0
+            self._opened_at = 0.0
+            self._half_open_in_flight = False
+
+
+rate_limiter = RateLimiter()
+circuit_breaker = CircuitBreaker()
 
 
 def api_key() -> str:
@@ -46,16 +183,25 @@ def _client():
 
 
 def _chat(messages: list[dict[str, Any]], max_tokens: int = 400) -> str | None:
-    """One chat completion; None on any failure."""
+    """One chat completion; None on any failure, rate limit, or open circuit."""
     client = _client()
     if client is None:
+        return None
+    if not circuit_breaker.allow_request():
+        log.warning("Meta API circuit breaker is OPEN, using offline fallback")
+        return None
+    if not rate_limiter.allow():
+        circuit_breaker.cancel_probe()
+        log.warning("Meta API rate limit exceeded, using offline fallback")
         return None
     try:
         resp = client.chat.completions.create(
             model=CHAT_MODEL, messages=messages, max_tokens=max_tokens, temperature=0.2
         )
+        circuit_breaker.record_success()
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
+        circuit_breaker.record_failure()
         log.warning("Meta API call failed, using offline fallback: %s", exc)
         return None
 
@@ -87,7 +233,7 @@ where bbox is the line's box in image pixels, origin top-left."""
 
 def read_page(image_dataurl: str) -> list[dict[str, Any]]:
     """Muse Spark vision: page image -> [{text, bbox}]. Empty list offline or on failure."""
-    if not image_dataurl or is_offline():
+    if not image_dataurl or not image_dataurl.strip() or is_offline():
         return []
     reply = _chat(
         [{"role": "user", "content": [
@@ -130,7 +276,7 @@ def keyword_intent(command: str) -> str:
 
 def classify_intent(command: str) -> str:
     """hint | answer | check. Muse Spark when online, keywords otherwise."""
-    if not command or is_offline():
+    if not command or not command.strip() or is_offline():
         return keyword_intent(command)
     reply = _chat([
         {"role": "system", "content": "Classify a student's request to a math tutor. Reply with exactly one word: "
@@ -174,11 +320,22 @@ def phrase_hint(verdict: str, line: str, level: int, fallback: str | None = None
 
 def transcribe(audio_bytes: bytes, filename: str = "audio.webm") -> str:
     """Muse Voice Transcribe. Raises OfflineError offline or on failure (caller returns 503)."""
+    if not audio_bytes:
+        raise OfflineError("empty audio payload")
     client = _client()
     if client is None:
         raise OfflineError("no MODEL_API_KEY")
+    if not circuit_breaker.allow_request():
+        log.warning("Meta API circuit breaker is OPEN, skipping transcription")
+        raise OfflineError("circuit breaker open")
+    if not rate_limiter.allow():
+        circuit_breaker.cancel_probe()
+        log.warning("Meta API rate limit exceeded, skipping transcription")
+        raise OfflineError("rate limit exceeded")
     try:
         resp = client.audio.transcriptions.create(model=VOICE_MODEL, file=(filename, audio_bytes))
+        circuit_breaker.record_success()
     except Exception as exc:
+        circuit_breaker.record_failure()
         raise OfflineError(f"transcription failed: {exc}") from exc
     return (getattr(resp, "text", None) or "").strip()
