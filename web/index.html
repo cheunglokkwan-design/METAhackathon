@@ -165,8 +165,8 @@
   <input id="pick-image" type="file" accept="image/*" hidden>
   <input id="pick-page" type="file" accept="image/*,application/pdf,.pdf" hidden>
 
-  <button id="mic" class="mic" data-state="idle" title="Hey Meta (tap to speak)">
-    <span class="orb"><svg><use href="#i-mic"/></svg></span><span class="label">Hey Meta</span><kbd class="hint">/</kbd>
+  <button id="mic" class="mic" data-state="idle" title="Mic on/off: tap to dictate into the bar" aria-pressed="false">
+    <span class="orb"><svg><use href="#i-mic"/></svg></span><span class="label">Mic off</span><kbd class="hint">/</kbd>
   </button>
 
   <div id="cmd" class="cmd" hidden>
@@ -175,6 +175,8 @@
       <input type="text" placeholder="Ask Meta… e.g. “help me with this integral”" autocomplete="off" spellcheck="false" aria-label="Command for Meta">
       <kbd>↵</kbd>
     </form>
+    <div class="vbar"><span class="vstate">Mic off</span><button type="button" class="vengine" hidden>Use Meta transcription</button></div>
+    <div class="vnote" role="status" aria-live="polite" hidden></div>
     <div class="chips">
       <button data-mode="hint" data-say="help me">Help me</button>
       <button data-mode="check" data-say="check my work">Check my work</button>

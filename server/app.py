@@ -33,11 +33,11 @@ async def _cap_upload_size(request, call_next):
     """
     if request.method == "POST" and request.url.path == "/api/transcribe":
         size = request.headers.get("content-length")
-        if size is None:
-            return JSONResponse({"detail": "Content-Length required"}, status_code=411)
-        if not size.isdigit():
+        # Proxies (Vercel) may forward the upload chunked with no Content-Length; the route
+        # still reads at most MAX_AUDIO_BYTES + 1, so only a stated size is checked here.
+        if size is not None and not size.isdigit():
             return JSONResponse({"detail": "bad Content-Length"}, status_code=400)
-        if int(size) > meta_client.MAX_AUDIO_BYTES + FORM_OVERHEAD:
+        if size is not None and int(size) > meta_client.MAX_AUDIO_BYTES + FORM_OVERHEAD:
             return JSONResponse({"detail": "audio too large"}, status_code=413)
     return await call_next(request)
 
