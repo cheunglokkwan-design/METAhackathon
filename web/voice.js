@@ -6,8 +6,36 @@ const SERVER_ERRORS = new Set(['network', 'service-not-allowed', 'language-not-s
 const UPLOAD_ERRORS = {
   400: 'I didn’t catch that.',
   413: 'That recording was too long. Try a shorter command.',
+  415: 'Meta needs WAV audio and this recording wasn’t one.',
   503: 'Voice transcription is unavailable right now. Press / to type your command.',
 };
+const WAV_RATE = 16000;
+
+// Muse Voice Transcribe takes only 16-bit mono PCM WAV at 16 or 24 kHz, and browsers record
+// webm/opus (Chrome) or mp4/aac (Safari). Decode the recording and write it out as WAV.
+export async function toWav(blob) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AC();
+  try {
+    const bytes = await blob.arrayBuffer();
+    const buf = await new Promise((ok, bad) => { const p = ctx.decodeAudioData(bytes, ok, bad); p?.then?.(ok, bad); });
+    const chans = [...Array(buf.numberOfChannels)].map((_, c) => buf.getChannelData(c));
+    const step = buf.sampleRate / WAV_RATE, n = Math.floor(buf.length / step);
+    const out = new DataView(new ArrayBuffer(44 + n * 2));
+    const str = (o, t) => [...t].forEach((ch, i) => out.setUint8(o + i, ch.charCodeAt(0)));
+    str(0, 'RIFF'); out.setUint32(4, 36 + n * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
+    out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+    out.setUint32(24, WAV_RATE, true); out.setUint32(28, WAV_RATE * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
+    str(36, 'data'); out.setUint32(40, n * 2, true);
+    for (let i = 0; i < n; i++) {                      // average each window: mono and anti-aliased
+      const a = Math.floor(i * step), b = Math.max(a + 1, Math.floor((i + 1) * step));
+      let sum = 0; for (const ch of chans) for (let j = a; j < b; j++) sum += ch[j] || 0;
+      const v = Math.max(-1, Math.min(1, sum / ((b - a) * chans.length)));
+      out.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
+    }
+    return new Blob([out.buffer], { type: 'audio/wav' });
+  } finally { ctx.close?.(); }
+}
 const SILENCE_MS = 1300, MAX_MS = 15000, START_GRACE_MS = 4000;
 
 export const stripWake = t => { const m = t.match(WAKE); return (m ? t.slice(m.index + m[0].length) : t).trim(); };
@@ -42,6 +70,9 @@ export class Voice {
     this.state('idle');
   }
   stopWake() { if (this.wake) { this.wake = false; this.h.onWake?.(false); } }
+  // "/" or Enter while listening: stop now and use what was said so far.
+  get busy() { return !!(this.recording || (this.rec && !this.wake)); }
+  stop() { if (this.recording?.state === 'recording') this.recording.stop(); else if (this.rec && !this.wake) this.rec.stop(); }
   fire(t) { this.armedUntil = 0; this.state('idle'); if (t) this.h.onCommand(t); }
 
   // Tap the mic: capture one utterance (wake word optional).
@@ -133,10 +164,19 @@ export class Voice {
       this.state('transcribing');
       try {
         const blob = new Blob(chunks, { type: rec.mimeType || 'audio/webm' });
-        const ext = blob.type.includes('mp4') ? 'mp4' : blob.type.includes('ogg') ? 'ogg' : 'webm';
-        const fd = new FormData(); fd.append('audio', blob, `command.${ext}`);
+        if (!blob.size) { this.state('idle'); this.h.onError?.('The microphone recorded nothing. Check the mic permission for this site.'); return; }
+        let wav;
+        try { wav = await toWav(blob); }
+        catch (err) { console.warn('[margin] could not convert recording:', err); this.state('idle'); this.h.onError?.(`This browser’s recording (${blob.type || 'unknown'}) couldn’t be converted for Meta. Press / to type.`); return; }
+        const fd = new FormData(); fd.append('audio', wav, 'command.wav');
         const r = await fetch('/api/transcribe', { method: 'POST', body: fd });
-        if (!r.ok) { this.state('idle'); this.h.onError?.(UPLOAD_ERRORS[r.status] || UPLOAD_ERRORS[503]); return; }
+        if (!r.ok) {
+          const detail = await r.json().then(j => j.detail, () => '');
+          console.warn('[margin] transcribe HTTP', r.status, detail);
+          this.state('idle');
+          this.h.onError?.(r.status === 502 && detail ? `${detail}. Press / to type.` : UPLOAD_ERRORS[r.status] || `${UPLOAD_ERRORS[503]} (${r.status})`);
+          return;
+        }
         const t = commandFrom((await r.json()).text || '');
         if (t) this.fire(t); else { this.state('idle'); this.h.onError?.('I didn’t catch that. Tap the mic and try again.'); }
       } catch (err) {
@@ -146,7 +186,7 @@ export class Voice {
       }
     };
     rec.start(250);
-    this.state('listening', 'Listening… (tap to stop)');
+    this.state('listening', 'Listening… (tap or press / to stop)');
     const timer = setTimeout(() => rec.state === 'recording' && rec.stop(), MAX_MS);
   }
 

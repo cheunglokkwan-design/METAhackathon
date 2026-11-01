@@ -6,6 +6,8 @@ import pytest
 from server import meta_client
 from server.meta_client import CircuitBreaker, OfflineError, RateLimiter
 
+WAV = b"RIFF\x24\x00\x00\x00WAVEfmt " + b"\x00" * 32
+
 
 class _DummyClient:
     """Fake OpenAI client for testing outbound instrumentation without network."""
@@ -129,22 +131,54 @@ def test_transcribe_respects_rate_limiter_and_circuit_breaker(monkeypatch):
     monkeypatch.setenv("META_RATE_LIMIT_CALLS", "1")
     monkeypatch.setenv("META_RATE_LIMIT_PERIOD", "60")
 
-    dummy = _DummyClient(transcript="integrate x squared")
-    monkeypatch.setattr(meta_client, "_client", lambda: dummy)
+    calls = []
+    monkeypatch.setattr(meta_client, "_asr_post", lambda b: calls.append(b) or {"transcript": "integrate x squared"})
 
-    assert meta_client.transcribe(b"audio-bytes") == "integrate x squared"
-    assert dummy.calls == 1
+    assert meta_client.transcribe(WAV) == "integrate x squared"
+    assert len(calls) == 1
 
     # Second call exceeds rate limit -> raises OfflineError without calling upstream
     with pytest.raises(OfflineError, match="rate limit"):
-        meta_client.transcribe(b"audio-bytes")
-    assert dummy.calls == 1
+        meta_client.transcribe(WAV)
+    assert len(calls) == 1
 
     # Empty audio payload is rejected before touching client or rate limiter
     meta_client.rate_limiter.reset()
     with pytest.raises(OfflineError, match="empty audio"):
         meta_client.transcribe(b"")
-    assert dummy.calls == 1
+    assert len(calls) == 1
+
+
+def test_transcribe_needs_wav_and_reports_meta_errors(monkeypatch):
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    meta_client.rate_limiter.reset()
+    meta_client.circuit_breaker.reset()
+    with pytest.raises(ValueError, match="WAV"):
+        meta_client.transcribe(b"\x1aE\xdf\xa3webm-bytes")
+
+    def reject(_):
+        raise meta_client.TranscribeError("Meta voice error 400: unsupported WAV")
+    monkeypatch.setattr(meta_client, "_asr_post", reject)
+    with pytest.raises(meta_client.TranscribeError, match="400"):
+        meta_client.transcribe(WAV)
+
+
+def test_asr_post_sends_multipart_wav(monkeypatch):
+    import httpx
+    seen = {}
+
+    def fake_post(url, headers, files, timeout):
+        seen.update(url=url, headers=headers, files=files)
+        return httpx.Response(200, json={"transcript": "help me", "turns": []})
+    monkeypatch.setenv("MODEL_API_KEY", "test-key")
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert meta_client._asr_post(WAV)["transcript"] == "help me"
+    assert seen["url"] == "https://api.meta.ai/v1/asr/transcribe"
+    assert seen["headers"]["Authorization"] == "Bearer test-key"
+    import json as _json
+    req = _json.loads(seen["files"]["request"][1])
+    assert req["model"] == "muse-voice-transcribe-1.0" and req["audioEncoding"] == "WAV"
+    assert seen["files"]["audio"][2] == "audio/wav"
 
 
 def test_security_base_url_validation(monkeypatch):
@@ -178,11 +212,15 @@ def test_security_read_page_rejects_external_urls(monkeypatch):
 
 def test_security_transcribe_does_not_leak_internal_errors(monkeypatch):
     monkeypatch.setenv("MODEL_API_KEY", "test-key")
-    dummy = _DummyClient(fail=RuntimeError("secret_key=sk-12345 internal url https://secret.internal"))
-    monkeypatch.setattr(meta_client, "_client", lambda: dummy)
+    meta_client.rate_limiter.reset()
+    meta_client.circuit_breaker.reset()
+
+    def boom(_):
+        raise RuntimeError("secret_key=sk-12345 internal url https://secret.internal")
+    monkeypatch.setattr(meta_client, "_asr_post", boom)
 
     with pytest.raises(OfflineError) as exc_info:
-        meta_client.transcribe(b"audio-bytes", filename="../../etc/passwd")
+        meta_client.transcribe(WAV, filename="../../etc/passwd")
     assert "sk-12345" not in str(exc_info.value)
     assert "secret.internal" not in str(exc_info.value)
 

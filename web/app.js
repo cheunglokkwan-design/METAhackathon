@@ -486,14 +486,15 @@ function scheduleAutoCheck() {
 
 // ---- command pill ("/") -------------------------------------------------------------------
 const cmd = $('#cmd'), cmdInput = $('#cmd input');
-function openCmd() {
+function openCmd(text = '') {
   if (!state.book) return;
   nb.commitInput();
   cmd.hidden = false;
   $('#toast').classList.remove('show');
-  cmdInput.value = '';
+  cmdInput.value = text;
   requestAnimationFrame(() => cmd.classList.add('open'));
   cmdInput.focus();
+  if (text) cmdInput.setSelectionRange(text.length, text.length);
 }
 function closeCmd() { if (cmd.hidden) return; cmd.classList.remove('open'); cmd.hidden = true; cmdInput.blur(); }
 $('#cmd form').onsubmit = e => {
@@ -518,6 +519,7 @@ addEventListener('keydown', e => {
   if (mod && k === '-') { e.preventDefault(); zoom.zoomBy(0.8); return; }
   if (mod && k === '0') { e.preventDefault(); zoom.reset(); return; }
   if (typing || mod || e.altKey) return;
+  if ((k === '/' || k === 'enter') && voice.busy) { e.preventDefault(); voice.stop(); return; }
   if (k === '/') { e.preventDefault(); openCmd(); }
   else if (k === 'p') setTool('pen');
   else if (k === 'e') setTool('eraser');
@@ -540,7 +542,7 @@ const voice = new Voice({
     micLabel.textContent = `“${short(text)}”`;
     clearTimeout(heardTimer);
     heardTimer = setTimeout(() => { mic.dataset.state = 'idle'; micLabel.textContent = idleLabel(); }, 2600);
-    callMeta(text, 'auto');
+    openCmd(text);                                   // show what was heard; Enter sends it to Meta
   },
   onState: (state, text) => {
     if (mic.dataset.state === 'heard' && state === 'idle') return;

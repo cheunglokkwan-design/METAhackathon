@@ -493,19 +493,64 @@ def phrase_hint(verdict: str, line: str, level: int, fallback: str | None = None
 # --------------------------------------------------------------------------- voice
 
 
-def transcribe(audio_bytes: bytes, filename: str = "audio.webm") -> str:
-    """Muse Voice Transcribe. Raises OfflineError offline or on failure (caller returns 503)."""
+# Calculus words the recogniser should prefer ("integral", not "in a grill").
+VOICE_KEYWORDS = ["Meta", "integral", "integrate", "derivative", "differentiate", "sine", "cosine",
+                  "tangent", "dx", "chain rule", "product rule", "quotient rule", "limit", "squared",
+                  "cubed", "hint", "check my work", "answer", "graph", "tidy", "why", "next step"]
+
+
+class TranscribeError(Exception):
+    """Muse Voice Transcribe answered with an error. The message is safe to show the student."""
+
+
+def is_wav(data: bytes) -> bool:
+    return len(data) > 12 and data[:4] == b"RIFF" and data[8:12] == b"WAVE"
+
+
+def _asr_post(audio_bytes: bytes) -> dict[str, Any]:
+    """POST /asr/transcribe: multipart with a JSON `request` part and a WAV `audio` part."""
+    import httpx
+
+    settings = {"model": VOICE_MODEL, "audioEncoding": "WAV", "mode": "PUSH_TO_TALK",
+                "keywords": VOICE_KEYWORDS, "languageBias": ["English"]}
+    resp = httpx.post(
+        base_url().rstrip("/") + "/asr/transcribe",
+        headers={"Authorization": f"Bearer {api_key()}", "Accept": "application/json"},
+        files={"request": (None, json.dumps(settings), "application/json"),
+               "audio": ("command.wav", audio_bytes, "audio/wav")},
+        timeout=30.0,
+    )
+    if resp.status_code != 200:
+        try:
+            err = resp.json()
+            err = err.get("error", err) if isinstance(err, dict) else {}
+            msg = str(err.get("message") or err.get("type") or "")[:120]
+        except Exception:
+            msg = ""
+        log.warning("Meta transcription HTTP %s: %s", resp.status_code, msg)
+        raise TranscribeError(f"Meta voice error {resp.status_code}" + (f": {msg}" if msg else ""))
+    return resp.json()
+
+
+def transcribe(audio_bytes: bytes, filename: str = "command.wav") -> str:
+    """Muse Voice Transcribe on a 16 or 24 kHz mono 16-bit WAV (the browser converts).
+
+    Raises OfflineError offline or when the call can't be made (caller returns 503),
+    ValueError when the audio is not WAV, TranscribeError when Meta rejects it.
+    """
     if not audio_bytes:
         raise OfflineError("empty audio payload")
     if len(audio_bytes) > MAX_AUDIO_BYTES:
         raise OfflineError("audio payload too large")
+    if is_offline():
+        raise OfflineError("no MODEL_API_KEY")
     try:
-        client = _client()
-    except Exception as exc:
+        base_url()
+    except ValueError as exc:
         log.warning("Meta client configuration invalid: %s", exc)
         raise OfflineError("service unavailable") from exc
-    if client is None:
-        raise OfflineError("no MODEL_API_KEY")
+    if not is_wav(audio_bytes):
+        raise ValueError("Muse Voice Transcribe needs WAV audio")
     if not circuit_breaker.allow_request():
         log.warning("Meta API circuit breaker is OPEN, skipping transcription")
         raise OfflineError("circuit breaker open")
@@ -513,12 +558,15 @@ def transcribe(audio_bytes: bytes, filename: str = "audio.webm") -> str:
         circuit_breaker.cancel_probe()
         log.warning("Meta API rate limit exceeded, skipping transcription")
         raise OfflineError("rate limit exceeded")
-    safe_name = os.path.basename(filename or "audio.webm") or "audio.webm"
     try:
-        resp = client.audio.transcriptions.create(model=VOICE_MODEL, file=(safe_name, audio_bytes))
+        body = _asr_post(audio_bytes)
         circuit_breaker.record_success()
+    except TranscribeError:
+        circuit_breaker.record_success()               # Meta answered; the audio was the problem
+        raise
     except Exception as exc:
         circuit_breaker.record_failure()
         log.warning("Meta transcription failed: %s", type(exc).__name__)
         raise OfflineError("transcription failed") from exc
-    return (getattr(resp, "text", None) or "").strip()
+    text = body.get("transcript") or " ".join(t.get("transcript", "") for t in body.get("turns") or [])
+    return (text or "").strip()
