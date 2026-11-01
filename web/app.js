@@ -401,7 +401,7 @@ async function callMeta(command, mode = 'auto', { escalate = false } = {}) {
   if (/^(more|more help|another hint|next hint|a bit more)\b/i.test(command.trim())) { mode = 'hint'; escalate = true; }
   const sig = nb.signature();
   const payload = { lines, command, mode, hint_level: nextHintLevel(lines, sig, escalate) };
-  if (nb.hasStrokes() || nb.hasImages()) payload.image = nb.snapshot();
+  if (nb.hasStrokes() || nb.hasImages()) { payload.image = nb.snapshot(); payload.ink_rows = nb.inkRows(); }
   const pageId = current().id;
 
   busy = true;
@@ -582,6 +582,7 @@ async function demo() {
 fetch('/api/health').then(r => r.json()).then(h => {
   $('#status').textContent = h.offline ? 'Meta: offline mode (reads typed lines only)' : `Meta: online · ${h.model || ''}`;
   $('#status').dataset.ok = !h.offline;
+  voice.serverVoice = !h.offline;                 // Muse Voice Transcribe works on every browser
 }).catch(() => { $('#status').textContent = 'Meta: server not reachable'; });
 
 // ---- offline app shell ---------------------------------------------------------------------------
