@@ -40,7 +40,7 @@ pen strokes / typed lines ──► Muse Spark 1.3 reads the page into math line
 ```
 
 - Meta models: **Muse Spark 1.3** (page reading, intent, hint wording), **Muse Voice Transcribe**
-  (voice commands, with browser Web Speech as fallback).
+  (voice commands when browser Web Speech is missing or fails).
 - API contract between page and server: [docs/CONTRACT.md](docs/CONTRACT.md).
 
 ## Run it

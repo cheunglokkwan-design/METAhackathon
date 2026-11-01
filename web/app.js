@@ -410,7 +410,7 @@ async function callMeta(command, mode = 'auto', { escalate = false } = {}) {
     notebook_id: state.book?.id || null,
     page_id: pageId,
   };
-  if (nb.hasStrokes() || nb.hasImages()) payload.image = nb.snapshot();
+  if (nb.hasStrokes() || nb.hasImages()) { payload.image = nb.snapshot(); payload.ink_rows = nb.inkRows(); }
 
   busy = true;
   showReading(true);
@@ -556,14 +556,15 @@ const voice = new Voice({
     micLabel.textContent = state === 'listening' ? (text ? `“${short(text)}”` : 'Listening…') : state === 'transcribing' ? 'One sec…' : idleLabel();
   },
   onError: msg => toast(msg),
+  onWake: on => showWake(on),                       // voice turned wake mode off by itself
 });
-mic.onclick = () => voice.listenOnce();
-wakeBtn.onclick = () => {
-  const on = voice.setWake(!voice.wake);
+function showWake(on) {
   wakeBtn.setAttribute('aria-pressed', on);
   mic.classList.toggle('armed', on);
   micLabel.textContent = idleLabel();
-};
+}
+mic.onclick = () => voice.listenOnce();
+wakeBtn.onclick = () => showWake(voice.setWake(!voice.wake));
 
 // ---- demo ----------------------------------------------------------------------------------------
 async function demo() {
@@ -590,6 +591,7 @@ async function demo() {
 fetch('/api/health').then(r => r.json()).then(h => {
   $('#status').textContent = h.offline ? 'Meta: offline mode (reads typed lines only)' : `Meta: online · ${h.model || ''}`;
   $('#status').dataset.ok = !h.offline;
+  voice.useServer = voice.serverOk = !h.offline;   // Muse Voice Transcribe works on every browser
 }).catch(() => { $('#status').textContent = 'Meta: server not reachable'; });
 
 // ---- offline app shell ---------------------------------------------------------------------------

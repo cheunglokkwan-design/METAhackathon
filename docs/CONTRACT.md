@@ -19,8 +19,9 @@ No chat box anywhere: all output is ink on the page.
   `MODEL_API_KEY`: reads the page image into math lines, runs the **agent loop** (picks
   tools, see below) and phrases hints. It never decides correctness and never writes maths
   on the page: SymPy does.
-- Muse Voice Transcribe (`muse-voice-transcribe-1.0`): voice commands. Browser Web
-  Speech API is the fallback.
+- Muse Voice Transcribe (`muse-voice-transcribe-1.0`): voice commands when the browser's
+  Web Speech API is missing or fails (offline, speech service disabled). Web Speech is
+  tried first.
 - With no `MODEL_API_KEY`, the server runs in **offline mode**: no image reading (the page
   must contain typed lines, see `lines` below), rule-based hints, keyword routing.
 
@@ -127,8 +128,16 @@ distinct from the student's), animated as if being written.
 
 ## POST /api/transcribe
 
-multipart `audio` file (webm/ogg/wav). Returns `{"text": "..."}`; 503 when offline so the
-page falls back to Web Speech API.
+multipart `audio` file (webm/ogg/wav, at most 10 MB). Returns `{"text": "..."}`.
+The page calls this only when Web Speech is missing or fails with `network`,
+`service-not-allowed` or `language-not-supported`, and checks `/api/health` first.
+
+| status | meaning |
+|---|---|
+| 400 | empty audio, or a non-numeric `Content-Length` |
+| 411 | no `Content-Length` header |
+| 413 | audio over 10 MB (refused from the header, before the body is read) |
+| 503 | offline (no `MODEL_API_KEY`), rate limited, circuit open or upstream failure |
 
 ## GET /api/health
 

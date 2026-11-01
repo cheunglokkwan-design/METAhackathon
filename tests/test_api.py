@@ -1,4 +1,6 @@
 """API tests in offline mode via FastAPI's TestClient."""
+import asyncio
+
 from fastapi.testclient import TestClient
 
 from server.app import app
@@ -82,6 +84,36 @@ def test_offline_image_only_explains():
 def test_transcribe_offline_503():
     r = client.post("/api/transcribe", files={"audio": ("a.webm", b"\x00\x01", "audio/webm")})
     assert r.status_code == 503
+
+
+def test_transcribe_empty_audio_400():
+    r = client.post("/api/transcribe", files={"audio": ("a.webm", b"", "audio/webm")})
+    assert r.status_code == 400
+
+
+def test_transcribe_oversized_audio_413(monkeypatch):
+    from server import meta_client
+
+    monkeypatch.setattr(meta_client, "MAX_AUDIO_BYTES", 10)
+    r = client.post("/api/transcribe", files={"audio": ("a.webm", b"x" * 11, "audio/webm")})
+    assert r.status_code == 413
+
+
+def test_transcribe_refuses_large_body_from_header():
+    from server import app as app_module, meta_client
+
+    too_big = meta_client.MAX_AUDIO_BYTES + app_module.FORM_OVERHEAD + 1
+    r = client.post("/api/transcribe", content=b"x", headers={"content-length": str(too_big),
+                                                             "content-type": "multipart/form-data; boundary=b"})
+    assert r.status_code == 413
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+
+def test_transcribe_does_not_block_the_event_loop():
+    from server import app as app_module
+
+    route = next(r for r in app_module.app.routes if getattr(r, "path", "") == "/api/transcribe")
+    assert not asyncio.iscoroutinefunction(route.endpoint)
 
 
 def test_unreadable_line_is_unchecked():

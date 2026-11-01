@@ -1,6 +1,6 @@
 // Margin service worker: the app shell opens offline. /api/* always goes to the network.
 // pdf.js (vendor/pdfjs/) is not in the shell: it is cached the first time a PDF is imported.
-const VERSION = 'margin-v3';
+const VERSION = 'margin-v5';
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
   'app.js', 'ink.js', 'assistant.js', 'voice.js', 'store.js', 'shelf.js', 'pages.js', 'zoom.js', 'export.js', 'ui.js', 'images.js',
@@ -10,7 +10,10 @@ const SHELL = [
 const FONTS = /^https:\/\/fonts\.(googleapis|gstatic)\.com\//;
 
 self.addEventListener('install', e => {
-  e.waitUntil(caches.open(VERSION).then(c => c.addAll(SHELL)).then(() => self.skipWaiting()));
+  // cache: 'reload' skips the HTTP cache, so a new VERSION never stores yesterday's files.
+  e.waitUntil(caches.open(VERSION)
+    .then(c => c.addAll(SHELL.map(u => new Request(u, { cache: 'reload' }))))
+    .then(() => self.skipWaiting()));
 });
 self.addEventListener('activate', e => {
   e.waitUntil(caches.keys()
@@ -28,7 +31,9 @@ self.addEventListener('fetch', e => {
   e.respondWith(caches.open(VERSION).then(async cache => {
     const key = req.mode === 'navigate' ? 'index.html' : req;
     const hit = await cache.match(key, { ignoreSearch: req.mode === 'navigate' });
-    const fresh = fetch(req).then(res => {
+    // Same-origin refreshes revalidate (a cheap 304 when unchanged) instead of trusting the HTTP cache.
+    const refresh = url.origin === location.origin ? fetch(req.url, { cache: 'no-cache' }) : fetch(req);
+    const fresh = refresh.then(res => {
       if (res && (res.ok || res.type === 'opaque')) cache.put(key, res.clone());
       return res;
     }).catch(() => hit);

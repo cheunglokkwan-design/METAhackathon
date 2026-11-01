@@ -196,7 +196,28 @@ def test_security_sympy_parser_blocks_builtins_and_dos():
         "eval('1+1')",
         "x^99999999",
         "x + " * 200,
+        # power towers and exponents the old regex missed
+        "9^9^9",
+        "2^(99999999)",
+        "2**99999999",
+        "(x^40)^40",
+        "e^(99999999 ln 9)",
+        "exp(99999999*log(x))",
+        "[x^999]_0^(2^999)",
+        "99999999999999999999^999",
+        # attribute access with whitespace, and keywords
+        "x . subs(x, 2)",
+        "(1). evalf()",
+        "lambda: 1",
     ):
         parsed = parse_line(payload)
-        assert not parsed.ok
+        assert not parsed.ok, payload
+
+
+def test_security_sympy_guard_keeps_ordinary_math():
+    from server.checker import parse_line
+
+    for text in ("x^1000", "2^1000", "3.5x + .5", "e^(-x^2)", "x^(1/2)", "2^x",
+                 "∫_0^1 x^2 dx = 1/3", "[x^3/3]_0^2", "d/dx (x^2+1)^5"):
+        assert parse_line(text).ok, text
 
