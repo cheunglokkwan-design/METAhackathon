@@ -21,6 +21,25 @@ logging.basicConfig(level=logging.INFO)
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 app = FastAPI(title="Margin", version="0.2.0")
+# Multipart framing around the audio itself: boundaries, part headers, filename.
+FORM_OVERHEAD = 64 * 1024
+
+
+@app.middleware("http")
+async def _cap_upload_size(request, call_next):
+    """Refuse an oversized upload from its header, before the body is received.
+
+    Registered before _security_headers so those headers still wrap this response.
+    """
+    if request.method == "POST" and request.url.path == "/api/transcribe":
+        size = request.headers.get("content-length")
+        if size is None:
+            return JSONResponse({"detail": "Content-Length required"}, status_code=411)
+        if not size.isdigit():
+            return JSONResponse({"detail": "bad Content-Length"}, status_code=400)
+        if int(size) > meta_client.MAX_AUDIO_BYTES + FORM_OVERHEAD:
+            return JSONResponse({"detail": "audio too large"}, status_code=413)
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -141,8 +160,13 @@ def assist(req: AssistRequest) -> dict[str, Any]:
 
 
 @app.post("/api/transcribe")
-async def transcribe(audio: UploadFile = File(...)) -> dict[str, str]:
-    data = await audio.read(meta_client.MAX_AUDIO_BYTES + 1)
+def transcribe(audio: UploadFile = File(...)) -> dict[str, str]:
+    # Plain def: the upstream call blocks, so FastAPI runs this in its threadpool.
+    data = audio.file.read(meta_client.MAX_AUDIO_BYTES + 1)
+    if not data:
+        raise HTTPException(status_code=400, detail="empty audio")
+    if len(data) > meta_client.MAX_AUDIO_BYTES:
+        raise HTTPException(status_code=413, detail="audio too large")
     try:
         return {"text": meta_client.transcribe(data, audio.filename or "audio.webm")}
     except OfflineError as exc:
