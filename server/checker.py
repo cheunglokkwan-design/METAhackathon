@@ -14,8 +14,11 @@ Public API:
 
 from __future__ import annotations
 
+import io
+import keyword
 import random
 import re
+import tokenize
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -183,6 +186,83 @@ _SAFE_GLOBALS: dict[str, Any] = {
 }
 
 
+# Largest exponent a term may carry, multiplied through nested powers: x^999 is fine,
+# x^1001 and (x^40)^40 are not. Number towers such as 9^9^9 are caught before SymPy
+# tries to build the exact integer.
+MAX_EXPONENT = 1000
+MAX_NUMBER_BITS = 20_000  # ~6000 digits: the biggest exact number a power may produce
+
+
+def _reject_unsafe_tokens(conv: str) -> None:
+    """Reject attribute access, dunders and Python keywords before anything is evaluated."""
+    try:
+        tokens = list(tokenize.generate_tokens(io.StringIO(conv).readline))
+    except (tokenize.TokenError, SyntaxError):
+        raise ValueError("unreadable expression") from None
+    for tok in tokens:
+        if (tok.type == tokenize.OP and tok.string == ".") or (
+            tok.type == tokenize.NAME and ("__" in tok.string or keyword.iskeyword(tok.string))
+        ):
+            raise ValueError("unsafe expression")
+
+
+def _exponent_size(ex: sp.Expr) -> float | None:
+    """How large an exponent is, or None when it cannot blow up (e.g. `2^x`).
+
+    A symbolic exponent with a log in it (`e^(9999 ln x)`) evaluates to a plain power,
+    so its biggest coefficient counts as the exponent.
+    """
+    if not ex.free_symbols:
+        val = sp.N(ex)
+        return float(abs(val)) if val.is_Number else None
+    if ex.has(sp.log):
+        return max((float(abs(n)) for n in ex.atoms(sp.Number)), default=None)
+    return None
+
+
+def _check_powers(e: sp.Basic) -> int:
+    """Walk an unevaluated expression bottom-up; return its nested exponent product.
+
+    Raises ValueError for anything that would make SymPy build a huge exact number or
+    polynomial. Children are checked before a node is evaluated numerically, so the
+    sizes measured here are always small enough to compute.
+    """
+    if not e.args:
+        return 1
+    if isinstance(e, sp.Pow) or isinstance(e, sp.exp):
+        base, ex = e.args if isinstance(e, sp.Pow) else (sp.E, e.args[0])
+        mult = _check_powers(base)
+        _check_powers(ex)
+        size = _exponent_size(ex)
+        if size is None:
+            return mult
+        mult = max(1, round(mult * max(size, 1.0)))
+        if mult > MAX_EXPONENT:
+            raise ValueError("exponent too large")
+        if not base.free_symbols and isinstance(e, sp.Pow):
+            b = sp.N(base)
+            if b.is_Number and b != 0 and size * abs(float(sp.log(abs(b), 2))) > MAX_NUMBER_BITS:
+                raise ValueError("number too large")
+        return mult
+    return max(_check_powers(a) for a in e.args)
+
+
+def _guard_size(conv: str, local: dict[str, Any]) -> None:
+    """Parse `conv` without evaluating anything and reject oversized powers."""
+
+    def _eval_at(F, a, b):
+        syms = sorted(F.free_symbols, key=str)
+        v_ = syms[0] if len(syms) == 1 else X
+        return F.xreplace({v_: b}) - F.xreplace({v_: a})
+
+    with sp.evaluate(False):
+        expr = parse_expr(conv, local_dict={**local, "EVAL": _eval_at},
+                          global_dict=_SAFE_GLOBALS, transformations=TRANSFORMS)
+    # Measure outside the context: numeric evaluation needs evaluate=True to terminate.
+    if isinstance(expr, sp.Basic):
+        _check_powers(expr)
+
+
 def _local_dict(var: sp.Symbol) -> dict[str, Any]:
     return {
         "e": sp.E, "pi": sp.pi, "ln": sp.log, "log": sp.log, "Integral": sp.Integral,
@@ -253,8 +333,8 @@ def parse_line(text: str, defs: dict[str, tuple[sp.Expr, sp.Symbol]] | None = No
 
         local["EVAL"] = _eval_at
         try:
-            if "__" in conv or re.search(r"\.[a-zA-Z_]|\^\s*\d{4,}", raw):
-                raise ValueError("unsafe expression")
+            _reject_unsafe_tokens(conv)
+            _guard_size(conv, local)
             expr = parse_expr(conv, local_dict=local, global_dict=_SAFE_GLOBALS, transformations=TRANSFORMS)
             if not isinstance(expr, sp.Expr):
                 raise ValueError("not an expression")
