@@ -160,7 +160,7 @@ def _client():
     return OpenAI(base_url=base_url(), api_key=api_key(), timeout=30.0, max_retries=1)
 
 
-def _chat(messages: list[dict[str, Any]], max_tokens: int = 400) -> str | None:
+def _chat(messages: list[dict[str, Any]], max_tokens: int = 1500) -> str | None:
     """One chat completion; None on any failure, rate limit, or open circuit."""
     try:
         client = _client()
@@ -204,46 +204,111 @@ def _extract_json(text: str) -> Any:
 
 # --------------------------------------------------------------------------- page reading
 
-READ_PROMPT = """You are reading a photo of a calculus notebook page.
-Transcribe EACH handwritten math line, top to bottom, as plain text SymPy can parse:
-use ∫ ... dx for integrals, ^ for powers, sin(x), cos(x), ln(x), e^x, sqrt(x), and keep
-a leading "=" if the line starts with one. Write "+ C" if the student wrote it.
-Do not fix mistakes: copy exactly what is written. Skip doodles and prose.
-Return ONLY JSON: {"lines": [{"text": "∫ x cos(x) dx", "bbox": [x, y, w, h]}]}
-where bbox is the line's box in image pixels, origin top-left."""
+READ_PROMPT = """You are reading an image of a student's handwritten math notebook page.
+Transcribe EVERY line of handwritten math or numbers, top to bottom, even if it is simple
+arithmetic or not calculus. Write each line as plain text SymPy can parse: ∫ ... dx for
+integrals, ^ for powers, sin(x), cos(x), ln(x), e^x, sqrt(x); keep a leading "=" if the line
+starts with one, and "+ C" if the student wrote it. Copy mistakes exactly; do not fix them.
+Return ONLY JSON, no explanation: {"lines": [{"text": "∫ x cos(x) dx", "bbox": [x, y, w, h]}]}
+where bbox is the line's box in image pixels, origin top-left. If there is truly no math,
+return {"lines": []}."""
+
+# Muse Spark is a reasoning model: thinking tokens count against max_tokens, so a small budget
+# can end with an empty answer (finish_reason "length"). Give page reading plenty of room.
+READ_MAX_TOKENS = int(os.getenv("READ_MAX_TOKENS", "8000"))
+
+# Why the last read_page call found nothing, for the page's agent trace (None when it worked).
+last_read_error: str | None = None
+
+
+def _chat_full(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str | None, str]:
+    """Like _chat, but also says why there is no text: (text or None, reason)."""
+    try:
+        client = _client()
+    except Exception as exc:
+        return None, f"bad API config ({type(exc).__name__})"
+    if client is None:
+        return None, "offline"
+    if not circuit_breaker.allow_request():
+        return None, "Meta API paused after repeated errors"
+    if not rate_limiter.allow():
+        circuit_breaker.cancel_probe()
+        return None, "rate limit reached"
+    try:
+        resp = client.chat.completions.create(model=CHAT_MODEL, messages=messages, max_tokens=max_tokens)
+    except Exception as exc:
+        circuit_breaker.record_failure()
+        status = getattr(exc, "status_code", None)
+        log.warning("read_page: Meta API error %s: %s", status, str(exc)[:300])
+        return None, f"Meta API error {status or type(exc).__name__}"
+    circuit_breaker.record_success()
+    choice = resp.choices[0]
+    text = (choice.message.content or "").strip()
+    finish = getattr(choice, "finish_reason", None)
+    log.info("read_page: finish_reason=%s, %d chars, usage=%s", finish, len(text),
+             getattr(resp, "usage", None))
+    if not text:
+        return None, f"empty reply (finish_reason={finish})"
+    return text, "ok"
+
+
+def _parse_lines(reply: str) -> list[dict[str, Any]] | None:
+    """JSON lines from a reply; plain text lines as a fallback; None if nothing usable."""
+    try:
+        data = _extract_json(reply)
+    except ValueError:
+        data = None
+    if data is not None:
+        items = data.get("lines", []) if isinstance(data, dict) else data
+        lines = []
+        for item in items if isinstance(items, list) else []:
+            if isinstance(item, str) and item.strip():
+                lines.append({"text": item.strip(), "bbox": None})
+                continue
+            if not isinstance(item, dict) or not str(item.get("text", "")).strip():
+                continue
+            bbox = item.get("bbox")
+            ok = isinstance(bbox, list) and len(bbox) == 4 and all(isinstance(v, (int, float)) for v in bbox)
+            lines.append({"text": str(item["text"]).strip(), "bbox": [float(v) for v in bbox] if ok else None})
+        return lines
+    # Not JSON: take lines that look like maths (digits, operators or ∫).
+    rows = [r.strip(" -*`") for r in reply.splitlines()]
+    rows = [r for r in rows if r and re.search(r"[0-9∫=+^]", r) and len(r) < 120]
+    return [{"text": r, "bbox": None} for r in rows] or None
 
 
 def read_page(image_dataurl: str) -> list[dict[str, Any]]:
-    """Muse Spark vision: page image -> [{text, bbox}]. Empty list offline or on failure."""
+    """Muse Spark vision: page image -> [{text, bbox}]. Empty list offline or on failure.
+
+    Sets last_read_error to a short reason when nothing was read.
+    """
+    global last_read_error
+    last_read_error = None
     if not image_dataurl or is_offline():
+        last_read_error = "offline" if image_dataurl else "no page image"
         return []
     url = image_dataurl.strip()
     if len(url) > MAX_IMAGE_CHARS or not _DATA_IMAGE_RE.match(url):
         log.warning("read_page: rejected invalid or oversized image data URL")
+        last_read_error = "page image too large or not an image"
         return []
-    reply = _chat(
-        [{"role": "user", "content": [
-            {"type": "text", "text": READ_PROMPT},
-            {"type": "image_url", "image_url": {"url": url}},
-        ]}],
-        max_tokens=1200,
-    )
-    if not reply:
+    messages = [{"role": "user", "content": [
+        {"type": "text", "text": READ_PROMPT},
+        {"type": "image_url", "image_url": {"url": url}},
+    ]}]
+    reply, reason = _chat_full(messages, READ_MAX_TOKENS)
+    if reply is None and reason.startswith("empty reply"):
+        reply, reason = _chat_full(messages, READ_MAX_TOKENS * 2)   # one retry with more room
+    if reply is None:
+        last_read_error = reason
         return []
-    try:
-        data = _extract_json(reply)
-    except ValueError:
-        log.warning("read_page: reply was not JSON: %r", reply[:200])
+    lines = _parse_lines(reply)
+    if lines is None:
+        log.warning("read_page: unusable reply: %r", reply[:300])
+        last_read_error = "Meta's reply had no readable lines"
         return []
-    items = data.get("lines", []) if isinstance(data, dict) else data
-    lines = []
-    for item in items if isinstance(items, list) else []:
-        if not isinstance(item, dict) or not str(item.get("text", "")).strip():
-            continue
-        bbox = item.get("bbox")
-        if not (isinstance(bbox, list) and len(bbox) == 4):
-            bbox = None
-        lines.append({"text": str(item["text"]).strip(), "bbox": bbox})
+    if not lines:
+        last_read_error = "Meta saw no math on the page"
     return lines
 
 
@@ -276,7 +341,7 @@ def classify_intent(command: str) -> str:
          "check (wants to know whether their work is right), typeset (wants the page tidied or typed up), "
          "graph (wants a graph or sketch), or verify (wants the answer checked by differentiating)."},
         {"role": "user", "content": command},
-    ], max_tokens=5)
+    ], max_tokens=1500)
     word = (reply or "").strip().lower().strip(".!\"'")
     return word if word in INTENTS else keyword_intent(command)
 
@@ -360,7 +425,7 @@ def run_agent(command: str, lines: list[dict[str, Any]], image: str | None = Non
         try:
             resp = client.chat.completions.create(
                 model=CHAT_MODEL, messages=messages, tools=TOOL_SPECS, tool_choice="auto",
-                max_tokens=300, temperature=0.2)
+                max_tokens=4000, temperature=0.2)
             circuit_breaker.record_success()
             msg = resp.choices[0].message
         except Exception as exc:
@@ -418,7 +483,7 @@ def phrase_hint(verdict: str, line: str, level: int, fallback: str | None = None
                "Name the rule or mistake, but never write the corrected expression. ")
             + "No quotes, no emoji, no preamble.")},
         {"role": "user", "content": f"Student line: {line}\nChecker verdict: {verdict}\nRule-based hint: {fallback}"},
-    ], max_tokens=30)
+    ], max_tokens=1500)
     hint = (reply or "").strip().strip("\"'").splitlines()[0] if reply else ""
     if not hint or len(hint.split()) > 10:
         return fallback

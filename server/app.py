@@ -61,6 +61,9 @@ class AssistRequest(BaseModel):
     image: str | None = Field(default=None, max_length=5_000_000)
     lines: list[LineIn] = Field(default_factory=list, max_length=100)
     command: str = Field(default="", max_length=500)
+    # Boxes of the student's handwritten rows, top to bottom, measured on the page. More exact
+    # than the boxes a vision model guesses, and a fallback when it gives none.
+    ink_rows: list[list[float]] = Field(default_factory=list, max_length=100)
     mode: Literal["hint", "answer", "check", "typeset", "graph", "auto"] = "auto"
     hint_level: int = 1
 
@@ -78,7 +81,14 @@ def _gather_lines(req: AssistRequest) -> tuple[list[dict[str, Any]], bool]:
         return [{"id": l.id or f"L{i}", "text": l.text, "bbox": l.bbox} for i, l in enumerate(typed, 1)], False
     if req.image:
         read = meta_client.read_page(req.image)
-        return [{"id": f"L{i}", "text": l["text"], "bbox": l.get("bbox")} for i, l in enumerate(read, 1)], True
+        rows = [r for r in req.ink_rows if len(r) == 4]
+        out = []
+        for i, l in enumerate(read, 1):
+            bbox = l.get("bbox")
+            if len(rows) == len(read) or (bbox is None and i <= len(rows)):
+                bbox = rows[i - 1]
+            out.append({"id": f"L{i}", "text": l["text"], "bbox": bbox})
+        return out, True
     return [], False
 
 
@@ -93,15 +103,22 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
     lines, from_image = _gather_lines(req)
     trace: list[dict[str, str]] = []
     if from_image:
-        trace.append({"tool": "read_page", "summary": f"read {len(lines)} line(s) from the page"})
+        why = meta_client.last_read_error
+        trace.append({"tool": "read_page", "summary": (f"read {len(lines)} line(s) from the page" if lines
+                                                        else f"read nothing: {why}"[:90])})
 
     if not lines:
         mode = req.mode if req.mode != "auto" else meta_client.keyword_intent(req.command)
         mode = skills.TOOL_MODE.get(skills.INTENT_TOOL.get(mode, "give_hint"), "hint")
-        text = ("I can't read ink offline: type the line (T tool)" if offline
-                else "I couldn't find any math on this page")
+        why = meta_client.last_read_error if from_image else None
+        if offline:
+            text = "I can't read ink offline: type the line (T tool)"
+        elif why and why != "Meta saw no math on the page":
+            text = "I couldn't read the page just now. Try again?"
+        else:
+            text = "I couldn't find any math on this page"
         return {"mode": mode, "offline": offline, "lines": [], "first_wrong": None,
-                "verdict": "no lines to check",
+                "verdict": "no lines to check", "read_error": why,
                 "annotations": [{"kind": "note", "target": None, "text": text, "side": "right"}],
                 "agent_trace": trace + [{"tool": "none", "summary": "no lines to check"}]}
 

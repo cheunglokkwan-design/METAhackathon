@@ -589,6 +589,24 @@ export class Notebook {
   // Text boxes count row by row, so Meta can still write to the right of a short line in a wide box.
   occupied(box) { return this.items.some(it => !it.bg && (it.rowBoxes ? it.rowBoxes.some(b => overlap(b, box)) : overlap(it.bbox, box))); }
 
+  // Boxes of handwritten rows, top to bottom: pen strokes grouped where they overlap vertically
+  // (half the shorter stroke's height), so an integral sign and its small terms land in one row.
+  inkRows() {
+    const boxes = this.items.filter(it => it.type === 'stroke' && !it.hl && it.bbox).map(it => [...it.bbox])
+      .sort((a, b) => (a[1] + a[3] / 2) - (b[1] + b[3] / 2));
+    const rows = [];
+    for (const b of boxes) {
+      const r = rows.find(r => {
+        const ov = Math.min(r[1] + r[3], b[1] + b[3]) - Math.max(r[1], b[1]);
+        return ov > Math.min(r[3], b[3]) * 0.5;
+      });
+      if (!r) { rows.push(b); continue; }
+      const x2 = Math.max(r[0] + r[2], b[0] + b[2]), y2 = Math.max(r[1] + r[3], b[1] + b[3]);
+      r[0] = Math.min(r[0], b[0]); r[1] = Math.min(r[1], b[1]); r[2] = x2 - r[0]; r[3] = y2 - r[1];
+    }
+    return rows.sort((a, b) => a[1] - b[1]).map(r => r.map(v => Math.round(v)));
+  }
+
   // White page with the student's ink, typed text and pictures, cropped below the content.
   // JPEG when there is a photo on it (much smaller), PNG otherwise.
   snapshot() {
