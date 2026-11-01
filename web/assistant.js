@@ -1,5 +1,6 @@
 // Meta's ink: renders /api/assist annotations as handwriting on their own SVG layer.
 import { PAGE_W, PAGE_H, RULE, MARGIN_X, rowY, rowAt, baselineOf, overlap, inBox } from './ink.js';
+import { authClient } from './store.js';
 
 const NS = 'http://www.w3.org/2000/svg';
 const FONT = 'Caveat';
@@ -111,7 +112,7 @@ export async function assist(payload, timeoutMs = 45000) {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
-    const r = await fetch('/api/assist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal: ctl.signal });
+    const r = await authClient.fetchWithAuth('/api/assist', { method: 'POST', body: JSON.stringify(payload), signal: ctl.signal });
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     return await r.json();
   } finally { clearTimeout(timer); }

@@ -1,0 +1,69 @@
+# Production-ready Docker Compose stack: PostgreSQL 16 + Margin API Server
+# Usage:
+#   cp .env.example .env
+#   docker compose up --build -d
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: margin-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-margin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-margin_dev_secret_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-margin}
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=100"
+      - "-c"
+      - "shared_buffers=128MB"
+      - "-c"
+      - "work_mem=4MB"
+      - "-c"
+      - "statement_timeout=10000"
+      - "-c"
+      - "idle_in_transaction_session_timeout=15000"
+      - "-c"
+      - "log_min_duration_statement=500"
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - margin_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-margin} -d $${POSTGRES_DB:-margin}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    security_opt:
+      - no-new-privileges:true
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: margin-app
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: "8000"
+      ENV: ${ENV:-development}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-margin}:${POSTGRES_PASSWORD:-margin_dev_secret_change_me}@postgres:5432/${POSTGRES_DB:-margin}
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY:-change_this_to_a_64_char_random_hex_secret_in_production_2026}
+      PASSWORD_PEPPER: ${PASSWORD_PEPPER:-}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      MODEL_BASE_URL: ${MODEL_BASE_URL:-https://api.meta.ai/v1}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+      DB_CB_FAILURE_THRESHOLD: ${DB_CB_FAILURE_THRESHOLD:-4}
+      DB_CB_RECOVERY_TIMEOUT: ${DB_CB_RECOVERY_TIMEOUT:-30.0}
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  margin_pgdata:
+    driver: local

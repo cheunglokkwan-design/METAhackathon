@@ -242,6 +242,11 @@ kbd {
 }
 body.on-shelf .mic, body.on-shelf .coach, body.on-shelf .cmd { display: none; }
 .shelf-head { display: flex; align-items: center; justify-content: space-between; max-width: 1080px; margin: 0 auto; }
+.shelf-actions { display: flex; align-items: center; gap: 10px; }
+.auth-error { padding: 8px 12px; margin-bottom: 10px; border-radius: 9px; background: rgba(196,50,31,.09); color: #c4321f; font-size: 13px; }
+.sess-list { display: flex; flex-direction: column; gap: 6px; margin-top: 6px; max-height: 150px; overflow-y: auto; }
+.sess-row { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px; border-radius: 8px; background: rgba(0,0,0,.035); font-size: 13px; }
+.tiny-btn { height: 26px !important; padding: 0 10px !important; font-size: 12px; }
 .brand.big { gap: 10px; font-size: 17px; }
 .brand.big .mark-logo { width: 22px; height: 27px; }
 .shelf h1 { max-width: 1080px; margin: 34px auto 22px; font-size: 30px; font-weight: 600; letter-spacing: -.02em; }

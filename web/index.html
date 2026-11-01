@@ -44,7 +44,10 @@
   <section id="shelf" class="shelf" hidden>
     <header class="shelf-head">
       <div class="brand big"><span class="mark-logo"></span><b>Margin</b></div>
-      <button id="new-notebook" class="pill-btn"><svg><use href="#i-plus"/></svg><span>New notebook</span></button>
+      <div class="shelf-actions">
+        <button id="account-btn" class="toggle" title="Cloud account &amp; PostgreSQL sync"><i></i><span id="account-label">Sign in</span></button>
+        <button id="new-notebook" class="pill-btn"><svg><use href="#i-plus"/></svg><span>New notebook</span></button>
+      </div>
     </header>
     <h1>Notebooks</h1>
     <div class="shelf-grid"></div>
@@ -120,6 +123,7 @@
             <button data-act="zoom-out" title="Zoom out (⌘−)">−</button><button data-act="zoom-reset" id="zoom-label" title="Fit width (⌘0)">100%</button><button data-act="zoom-in" title="Zoom in (⌘+)">+</button>
           </div></div>
           <hr>
+          <button data-act="account"><b>Cloud account &amp; sync</b><small>PostgreSQL backup &amp; sessions</small></button>
           <button data-act="export-png">Export page as PNG</button>
           <button data-act="export-pdf">Export notebook as PDF</button>
           <hr>

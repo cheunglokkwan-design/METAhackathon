@@ -3,12 +3,12 @@ import { Notebook, PAGE_W, PAGE_H, PEN_SIZES, rowY, RULE } from './ink.js';
 import { saveImage, savePdfPages, isPdf } from './images.js';
 import { MetaInk, assist } from './assistant.js';
 import { Voice } from './voice.js';
-import { store, newPage, createNotebook } from './store.js';
+import { store, authClient, newPage, createNotebook } from './store.js';
 import { Shelf } from './shelf.js';
 import { Sidebar } from './pages.js';
 import { Zoom } from './zoom.js';
 import { exportPNG, exportPDF, paintPaper } from './export.js';
-import { toast, confirmDialog, closePopover } from './ui.js';
+import { toast, confirmDialog, accountDialog, closePopover } from './ui.js';
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -360,6 +360,7 @@ menu.onclick = e => {
     const hidden = page.classList.toggle('meta-hidden');
     e.target.closest('button').textContent = hidden ? 'Show Meta’s ink' : 'Hide Meta’s ink';
   }
+  if (act === 'account') openAccountModal();
   if (act === 'export-png') exportCurrentPNG();
   if (act === 'export-pdf') exportNotebookPDF();
 };
@@ -400,9 +401,16 @@ async function callMeta(command, mode = 'auto', { escalate = false } = {}) {
   if (!lines.length && !nb.hasStrokes() && !nb.hasImages()) { toast('Write something on the page first, then ask Meta.'); return; }
   if (/^(more|more help|another hint|next hint|a bit more)\b/i.test(command.trim())) { mode = 'hint'; escalate = true; }
   const sig = nb.signature();
-  const payload = { lines, command, mode, hint_level: nextHintLevel(lines, sig, escalate) };
-  if (nb.hasStrokes() || nb.hasImages()) payload.image = nb.snapshot();
   const pageId = current().id;
+  const payload = {
+    lines,
+    command,
+    mode,
+    hint_level: nextHintLevel(lines, sig, escalate),
+    notebook_id: state.book?.id || null,
+    page_id: pageId,
+  };
+  if (nb.hasStrokes() || nb.hasImages()) payload.image = nb.snapshot();
 
   busy = true;
   showReading(true);
@@ -589,13 +597,34 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   addEventListener('load', () => navigator.serviceWorker.register('sw.js').catch(err => console.info('[margin] no service worker', err)));
 }
 
+function updateAccountPill() {
+  const btn = $('#account-btn'), lbl = $('#account-label');
+  if (!btn || !lbl) return;
+  const authed = authClient.isAuthenticated();
+  btn.setAttribute('aria-pressed', authed);
+  lbl.textContent = authed ? (authClient.user?.display_name || authClient.user?.email || 'Synced') : 'Sign in';
+}
+async function openAccountModal() {
+  const res = await accountDialog(authClient, {
+    onSync: async () => {
+      const ok = await store.syncWithCloud();
+      if (ok) { toast('Synced notebooks with PostgreSQL.'); shelf.render(); }
+    },
+  });
+  updateAccountPill();
+  if (res === 'logout') toast('Signed out of cloud sync.');
+}
+$('#account-btn')?.addEventListener('click', openAccountModal);
+
 // ---- start ------------------------------------------------------------------------------------------
 (async () => {
   await store.ready();
+  updateAccountPill();
   if (!store.persistent) $('#storage-note').textContent = 'Storage is unavailable in this browser mode, so notebooks last until you close the tab.';
+  if (authClient.isAuthenticated()) await store.syncWithCloud();
   await seed();
   await route();
 })();
 
 // Exposed for debugging and tests.
-window.margin = { nb, meta, zoom, state, callMeta, demo, addPage, showPage, saveNow, store, setTool, insertImage, pageFromFile };
+window.margin = { nb, meta, zoom, state, callMeta, demo, addPage, showPage, saveNow, store, authClient, setTool, insertImage, pageFromFile };

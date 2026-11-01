@@ -77,6 +77,82 @@ export function confirmDialog({ heading, body, confirm = 'Delete', danger = true
       el('button', { type: 'submit', className: danger ? 'primary danger' : 'primary' }, confirm))));
 }
 
+// Cloud Account & Session Manager dialog (Sign In / Sign Up / Active Sessions / Quota).
+export function accountDialog(authClient, { onSync } = {}) {
+  return modal(done => {
+    if (authClient.isAuthenticated()) {
+      const u = authClient.user || {};
+      const usedMb = ((u.storage_bytes_used || 0) / (1024 * 1024)).toFixed(2);
+      const quotaMb = ((u.storage_quota_bytes || 52428800) / (1024 * 1024)).toFixed(0);
+      const sessList = el('div', { className: 'sess-list' }, el('small', {}, 'Loading active sessions…'));
+      authClient.listSessions().then(sessions => {
+        if (!sessions.length) { sessList.replaceChildren(el('small', {}, '1 active session')); return; }
+        sessList.replaceChildren(...sessions.map(s => el('div', { className: 'sess-row' },
+          el('span', {}, `${s.device_name}${s.is_current ? ' (this device)' : ''}`),
+          !s.is_current ? el('button', { type: 'button', className: 'ghost tiny-btn', onclick: async () => {
+            await authClient.revokeSession(s.id);
+            done('revoked');
+          } }, 'Revoke') : el('small', {}, 'Active'))));
+      });
+      return el('div', { className: 'dialog small' },
+        el('h2', {}, u.display_name || u.email || 'Cloud Account'),
+        el('p', {}, `${u.email} · ${usedMb} / ${quotaMb} MB used`),
+        el('div', { className: 'field-label' }, 'Active Sessions'),
+        sessList,
+        el('div', { className: 'dialog-actions' },
+          el('button', { type: 'button', className: 'ghost', onclick: () => done(null) }, 'Close'),
+          el('button', { type: 'button', className: 'ghost', onclick: async () => { await onSync?.(); done('synced'); } }, 'Sync now'),
+          el('button', { type: 'button', className: 'primary danger', onclick: async () => { await authClient.logout(); done('logout'); } }, 'Sign Out')));
+    }
+
+    let isRegister = false;
+    const errBox = el('div', { className: 'auth-error', hidden: true });
+    const nameInput = el('input', { type: 'text', id: 'auth-name', name: 'name', autocomplete: 'name', placeholder: 'Ada Lovelace', maxLength: 80 });
+    const nameWrap = el('label', { for: 'auth-name', hidden: true }, 'Name', nameInput);
+    const emailInput = el('input', { type: 'email', id: 'auth-email', name: 'email', autocomplete: 'username', inputMode: 'email', placeholder: 'you@example.com', required: true });
+    const passInput = el('input', { type: 'password', id: 'auth-password', name: 'password', autocomplete: 'current-password', placeholder: 'At least 8 chars (letter + number)', minLength: 8, maxLength: 128, required: true });
+    const submitBtn = el('button', { type: 'submit', className: 'primary' }, 'Sign In');
+    const heading = el('h2', {}, 'Sign in to Margin Cloud');
+    const switchBtn = el('button', { type: 'button', className: 'ghost', onclick() {
+      isRegister = !isRegister;
+      heading.textContent = isRegister ? 'Create your Margin account' : 'Sign in to Margin Cloud';
+      nameWrap.hidden = !isRegister;
+      passInput.autocomplete = isRegister ? 'new-password' : 'current-password';
+      submitBtn.textContent = isRegister ? 'Create Account' : 'Sign In';
+      switchBtn.textContent = isRegister ? 'Have an account? Sign In' : 'New here? Create account';
+      errBox.hidden = true;
+    } }, 'New here? Create account');
+
+    return el('form', { className: 'dialog small', async onsubmit(e) {
+      e.preventDefault();
+      errBox.hidden = true;
+      submitBtn.disabled = true;
+      try {
+        if (isRegister) await authClient.register(emailInput.value, passInput.value, nameInput.value);
+        else await authClient.login(emailInput.value, passInput.value);
+        await onSync?.();
+        done('authenticated');
+      } catch (err) {
+        errBox.textContent = err.message || 'Authentication failed';
+        errBox.hidden = false;
+      } finally {
+        submitBtn.disabled = false;
+      }
+    } },
+      heading,
+      el('p', {}, 'Sync your notebooks, ink and Meta’s hints to PostgreSQL.'),
+      errBox,
+      el('div', { className: 'dialog-fields' },
+        nameWrap,
+        el('label', { for: 'auth-email' }, 'Email', emailInput),
+        el('label', { for: 'auth-password' }, 'Password', passInput)),
+      el('div', { className: 'dialog-actions' },
+        switchBtn,
+        el('button', { type: 'button', className: 'ghost', onclick: () => done(null) }, 'Cancel'),
+        submitBtn));
+  });
+}
+
 // A popover menu anchored to a button. items: [{ label, fn, danger }]
 export function popover(anchor, items) {
   closePopover();
