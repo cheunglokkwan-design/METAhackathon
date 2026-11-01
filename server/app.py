@@ -8,6 +8,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import base64
 import logging
+import os
 from pathlib import Path
 import time
 from typing import Any, Literal
@@ -17,7 +18,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import auth, db as db_module, meta_client, skills
+from . import auth, db as db_module, meta_client, router, skills
 from .auth import (
     AuthError,
     REFRESH_COOKIE_NAME,
@@ -104,6 +105,10 @@ class AssistRequest(BaseModel):
     ink_rows: list[list[float]] = Field(default_factory=list, max_length=100)
     mode: Literal["hint", "answer", "check", "typeset", "graph", "auto"] = "auto"
     hint_level: int = 1
+    # Line history for the decision router (ROUTER_*); ignored when the router is off.
+    hints_given: int = Field(default=0, ge=0, le=20)
+    wrote_since_hint: bool = False
+    last_command: str = Field(default="", max_length=500)
     notebook_id: str | None = Field(default=None, max_length=64)
     page_id: str | None = Field(default=None, max_length=64)
     use_cache: bool = False
@@ -209,6 +214,7 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
 
     mode "auto" + online: Muse Spark runs the tool loop (meta_client.run_agent).
     mode "auto" offline (or agent failure): keyword routing. An explicit mode runs its tool.
+    mode "auto" with ROUTER_* set: the decision router first, then Spark, then keywords.
     """
     offline = meta_client.is_offline()
     level = max(1, min(3, int(req.hint_level or 1)))
@@ -239,6 +245,11 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
     out = None
     if req.mode != "auto":
         out = box.route(req.mode, f"mode {req.mode} from the page")
+    elif router.enabled():
+        sent = {"hints_given", "wrote_since_hint", "last_command"} & req.model_fields_set
+        session = (router.session_state(req.hints_given, req.wrote_since_hint, req.last_command) if sent
+                   else router.session_from_level(level))
+        out = router.route(req.command, box, req.image if from_image else None, session, spark=not offline)
     elif not offline:
         out = meta_client.run_agent(req.command, lines, req.image if from_image else None,
                                     hint_level=level, toolbox=box)
@@ -251,8 +262,11 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
     bbox_by_id = {l["id"]: l.get("bbox") for l in lines}
     out_lines = [{"id": r.id, "text": r.text, "latex": r.latex, "bbox": bbox_by_id.get(r.id), "status": r.status}
                  for r in result.lines]
-    return {"mode": out["mode"], "offline": offline, "lines": out_lines, "first_wrong": result.first_wrong,
+    resp = {"mode": out["mode"], "offline": offline, "lines": out_lines, "first_wrong": result.first_wrong,
             "verdict": result.verdict, "annotations": out["annotations"], "agent_trace": out["agent_trace"]}
+    if "router" in out:
+        resp["router"] = out["router"]  # router input + decision, logged with the interaction
+    return resp
 
 
 annotate = skills.annotate  # kept for callers of the old location
@@ -263,7 +277,10 @@ annotate = skills.annotate  # kept for callers of the old location
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    return {"ok": True, "offline": meta_client.is_offline(), "model": CHAT_MODEL}
+    out = {"ok": True, "offline": meta_client.is_offline(), "model": CHAT_MODEL}
+    if router.enabled():
+        out["router"] = {"model": os.getenv("ROUTER_MODEL", ""), "circuit_breaker": router.circuit_breaker.state}
+    return out
 
 
 @app.get("/api/health/db")

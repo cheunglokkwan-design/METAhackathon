@@ -24,6 +24,10 @@ No chat box anywhere: all output is ink on the page.
   tried first.
 - With no `MODEL_API_KEY`, the server runs in **offline mode**: no image reading (the page
   must contain typed lines, see `lines` below), rule-based hints, keyword routing.
+- Optional **decision router** (Muse Glimmer or any small model behind an OpenAI-compatible
+  endpoint, `ROUTER_BASE_URL` / `ROUTER_MODEL` / `ROUTER_API_KEY`): off unless configured.
+  When on, one short call picks intent, tool and hint level for `mode: "auto"`; Spark's agent
+  loop and then keywords are the fallbacks. See [ROUTER.md](ROUTER.md).
 
 ## Agent loop (server/skills.py, meta_client.run_agent)
 
@@ -69,7 +73,11 @@ Request JSON:
   ],
   "command": "hey meta help me with this integral",   // raw words from voice/typed
   "mode": "auto",          // "hint" | "answer" | "check" | "typeset" | "graph" | "auto" (derive from command)
-  "hint_level": 1          // 1 gentle nudge, 2 name the rule, 3 show the fix
+  "hint_level": 1,         // 1 gentle nudge, 2 name the rule, 3 show the fix
+  // Optional, used only when the decision router is on (then hint_level is the highest level allowed):
+  "hints_given": 0,        // hints already given on the current line
+  "wrote_since_hint": false,   // the student wrote something after the last hint
+  "last_command": ""       // the previous command
 }
 ```
 `bbox` is in page pixels (CSS px of the page, top-left origin).
@@ -104,7 +112,12 @@ Response JSON:
 plus `auto`). `agent_trace` is always present (may hold just one entry); each `summary` is
 ≤ 90 chars. Trace tools: the six tools above, plus `read_page` (lines read from the image),
 `route` (keyword/explicit routing), `muse-spark` (a model reply that was not a tool call),
-`none` (no lines).
+`router` (the decision router's choice, or why it fell back), `none` (no lines).
+
+With the decision router on, a `mode: "auto"` response also has
+`"router": {"state": {...}, "path": "router" | "spark" | "keywords", "decision": {...} | null}`:
+the router's input (command, SymPy verdict, session) and its validated decision, logged with the
+interaction so consented sessions can become training rows.
 
 Annotation kinds:
 

@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 .pytest_cache/
 .margin_data/
+# Router training data and downloaded datasets (scripts/build_router_data.py); never committed
+data/

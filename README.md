@@ -42,6 +42,8 @@ pen strokes / typed lines ──► Muse Spark 1.3 reads the page into math line
 - Meta models: **Muse Spark 1.3** (page reading, intent, hint wording), **Muse Voice Transcribe**
   (voice commands when browser Web Speech is missing or fails).
 - API contract between page and server: [docs/CONTRACT.md](docs/CONTRACT.md).
+- Optional decision router (Muse Glimmer, off by default): one short JSON call picks the tool and
+  hint level, with Spark as the fallback. Data builder, eval and fine-tuning: [docs/ROUTER.md](docs/ROUTER.md).
 
 ## Run it
 
@@ -55,7 +57,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 cp .env.example .env        # put your MODEL_API_KEY from https://dev.meta.ai in it
 .venv/bin/uvicorn server.app:app --reload
 # open http://localhost:8000  (⋯ menu → "Try the demo problem", then press / → Help me)
-.venv/bin/pytest -q         # 129 tests, offline
+.venv/bin/pytest -q         # offline, no network
 ```
 
 Without `MODEL_API_KEY` it runs in **offline mode**: typed lines (T tool) are checked and hints

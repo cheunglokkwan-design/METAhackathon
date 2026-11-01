@@ -37,16 +37,20 @@ class OfflineError(RuntimeError):
 
 
 class RateLimiter:
-    """Thread-safe sliding-window rate limiter for outbound Meta API calls."""
+    """Thread-safe sliding-window rate limiter for outbound model API calls.
 
-    def __init__(self, max_calls: int | None = None, period: float | None = None) -> None:
-        self._max_calls, self._period = max_calls, period
+    Limits come from <env_prefix>_RATE_LIMIT_CALLS / _PERIOD unless given explicitly.
+    """
+
+    def __init__(self, max_calls: int | None = None, period: float | None = None,
+                 env_prefix: str = "META") -> None:
+        self._max_calls, self._period, self._env = max_calls, period, env_prefix
         self._timestamps: deque[float] = deque()
         self._lock = threading.Lock()
 
     def allow(self) -> bool:
-        max_calls = self._max_calls if self._max_calls is not None else int(os.getenv("META_RATE_LIMIT_CALLS", "30"))
-        period = self._period if self._period is not None else float(os.getenv("META_RATE_LIMIT_PERIOD", "60.0"))
+        max_calls = self._max_calls if self._max_calls is not None else int(os.getenv(f"{self._env}_RATE_LIMIT_CALLS", "30"))
+        period = self._period if self._period is not None else float(os.getenv(f"{self._env}_RATE_LIMIT_PERIOD", "60.0"))
         if max_calls <= 0:
             return False
         now = time.monotonic()
@@ -64,18 +68,22 @@ class RateLimiter:
 
 
 class CircuitBreaker:
-    """Thread-safe circuit breaker (closed -> open -> half_open -> closed)."""
+    """Thread-safe circuit breaker (closed -> open -> half_open -> closed).
+
+    Settings come from <env_prefix>_CB_FAILURE_THRESHOLD / _RECOVERY_TIMEOUT unless given.
+    """
 
     CLOSED, OPEN, HALF_OPEN = "closed", "open", "half_open"
 
-    def __init__(self, failure_threshold: int | None = None, recovery_timeout: float | None = None) -> None:
-        self._threshold, self._timeout = failure_threshold, recovery_timeout
+    def __init__(self, failure_threshold: int | None = None, recovery_timeout: float | None = None,
+                 env_prefix: str = "META") -> None:
+        self._threshold, self._timeout, self._env = failure_threshold, recovery_timeout, env_prefix
         self._lock = threading.Lock()
         self.reset()
 
     def _cfg(self) -> tuple[int, float]:
-        t = self._threshold if self._threshold is not None else max(1, int(os.getenv("META_CB_FAILURE_THRESHOLD", "3")))
-        r = self._timeout if self._timeout is not None else float(os.getenv("META_CB_RECOVERY_TIMEOUT", "60.0"))
+        t = self._threshold if self._threshold is not None else max(1, int(os.getenv(f"{self._env}_CB_FAILURE_THRESHOLD", "3")))
+        r = self._timeout if self._timeout is not None else float(os.getenv(f"{self._env}_CB_RECOVERY_TIMEOUT", "60.0"))
         return t, r
 
     @property
@@ -137,14 +145,18 @@ def api_key() -> str:
     return os.getenv("MODEL_API_KEY", "").strip()
 
 
-def base_url() -> str:
-    """Validated Meta API base URL from MODEL_BASE_URL (HTTPS required except localhost)."""
-    url = os.getenv("MODEL_BASE_URL", BASE_URL).strip()
+def check_base_url(url: str, var: str = "MODEL_BASE_URL") -> str:
+    """`url` if it is https:// (or http://localhost); ValueError naming `var` otherwise."""
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     if not parsed.netloc or (parsed.scheme != "https" and not (parsed.scheme == "http" and host in ("localhost", "127.0.0.1"))):
-        raise ValueError("MODEL_BASE_URL must be an https:// URL (or http://localhost)")
+        raise ValueError(f"{var} must be an https:// URL (or http://localhost)")
     return url
+
+
+def base_url() -> str:
+    """Validated Meta API base URL from MODEL_BASE_URL (HTTPS required except localhost)."""
+    return check_base_url(os.getenv("MODEL_BASE_URL", BASE_URL).strip())
 
 
 def is_offline() -> bool:
