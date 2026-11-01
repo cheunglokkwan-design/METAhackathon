@@ -548,14 +548,15 @@ const voice = new Voice({
     micLabel.textContent = state === 'listening' ? (text ? `“${short(text)}”` : 'Listening…') : state === 'transcribing' ? 'One sec…' : idleLabel();
   },
   onError: msg => toast(msg),
+  onWake: on => showWake(on),                       // voice turned wake mode off by itself
 });
-mic.onclick = () => voice.listenOnce();
-wakeBtn.onclick = () => {
-  const on = voice.setWake(!voice.wake);
+function showWake(on) {
   wakeBtn.setAttribute('aria-pressed', on);
   mic.classList.toggle('armed', on);
   micLabel.textContent = idleLabel();
-};
+}
+mic.onclick = () => voice.listenOnce();
+wakeBtn.onclick = () => showWake(voice.setWake(!voice.wake));
 
 // ---- demo ----------------------------------------------------------------------------------------
 async function demo() {
