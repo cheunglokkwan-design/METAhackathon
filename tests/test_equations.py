@@ -58,3 +58,17 @@ def test_memory_lines_skip_the_page_read(monkeypatch):
     assert not called
     assert r["agent_trace"][0]["tool"] == "memory"
     assert [a["text"] for a in r["annotations"] if a["kind"] == "write"] == ["= 30 × (1/2)", "= 15"]
+
+
+def test_a_true_line_below_is_a_new_problem_not_a_wrong_step():
+    r = checker.check_lines(["sin 30 = 1/2", "1 + 1 = 2"])
+    assert r.first_wrong is None and [l.status for l in r.lines] == ["ok", "ok"]
+    assert checker.check_lines(["sin 30 = 1/2", "1 + 1 = 3"]).first_wrong == "L2"
+
+
+def test_dots_and_stacked_fractions_join_their_ink_row():
+    from server.app import _merge_small_rows, _nearest_row
+    rows = [[100, 95, 20, 8], [90, 120, 300, 60], [100, 400, 200, 50]]   # i-dot, "sin 30 = 1/2", "1 + 1 = 2"
+    merged = _merge_small_rows(rows)
+    assert len(merged) == 2 and merged[0][1] == 95
+    assert _nearest_row([80, 380, 250, 70], merged) == merged[1]

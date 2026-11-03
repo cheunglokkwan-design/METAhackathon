@@ -193,6 +193,33 @@ def _handle_db_exceptions(fn):
     return wrapper
 
 
+def _merge_small_rows(rows: list[list[float]]) -> list[list[float]]:
+    """Ink rows with the dot of an i, or the top of a stacked fraction, folded into the row they belong to."""
+    if len(rows) < 2:
+        return rows
+    hs = sorted(r[3] for r in rows)
+    med = hs[len(hs) // 2]
+    big = [list(r) for r in rows if r[3] >= med * 0.45] or [list(r) for r in rows]
+    for r in rows:
+        if r[3] >= med * 0.45:
+            continue
+        cy = r[1] + r[3] / 2
+        t = min(big, key=lambda b: max(0.0, b[1] - cy, cy - (b[1] + b[3])))
+        x0, y0 = min(t[0], r[0]), min(t[1], r[1])
+        x1, y1 = max(t[0] + t[2], r[0] + r[2]), max(t[1] + t[3], r[1] + r[3])
+        t[:] = [x0, y0, x1 - x0, y1 - y0]
+    return sorted(big, key=lambda b: b[1])
+
+
+def _nearest_row(bbox: list[float], rows: list[list[float]]) -> list[float]:
+    """The ink row that overlaps `bbox` most vertically (or whose centre is closest)."""
+    y0, y1 = bbox[1], bbox[1] + bbox[3]
+    def score(r):
+        ov = min(y1, r[1] + r[3]) - max(y0, r[1])
+        return (ov, -abs((r[1] + r[3] / 2) - (y0 + y1) / 2))
+    return max(rows, key=score)
+
+
 def _gather_lines(req: AssistRequest) -> tuple[list[dict[str, Any]], bool]:
     """Typed lines from the page are authoritative; otherwise read the page image.
 
@@ -203,12 +230,14 @@ def _gather_lines(req: AssistRequest) -> tuple[list[dict[str, Any]], bool]:
         return [{"id": l.id or f"L{i}", "text": l.text, "bbox": l.bbox} for i, l in enumerate(typed, 1)], False
     if req.image:
         read = meta_client.read_page(req.image)
-        rows = [r for r in req.ink_rows if len(r) == 4]
+        rows = _merge_small_rows([r for r in req.ink_rows if len(r) == 4])
         out = []
         for i, l in enumerate(read, 1):
             bbox = l.get("bbox")
             if len(rows) == len(read) or (bbox is None and i <= len(rows)):
                 bbox = rows[i - 1]
+            elif bbox is not None and rows:
+                bbox = _nearest_row(bbox, rows)     # Meta's box is a guess: use the real ink row it points at
             out.append({"id": f"L{i}", "text": l["text"], "bbox": bbox})
         return out, True
     return [], False

@@ -977,7 +977,8 @@ def check_lines(lines: list[Any]) -> CheckResult:
                 first_wrong, verdict = line_id, res.diagnosis.verdict
             continue
         starts_new = not p.continuation and (
-            prev is None or p.defines is not None or chain_kind(head) != "algebra")
+            prev is None or p.defines is not None or chain_kind(head) != "algebra"
+            or _new_fact(p, prev, var))
         if starts_new:
             prev, var = head, p.var
             bracket_pending = False
@@ -1185,6 +1186,24 @@ def trig_values(expr: sp.Expr) -> list[str]:
             v = sp.simplify(f.func(f.args[0] * sp.pi / 180))
             out.append(f"{f.func.__name__} {int(f.args[0])}° = {pretty(v)}")
     return out
+
+
+def _new_fact(p: ParsedLine, prev: sp.Expr, var: sp.Symbol) -> bool:
+    """A line that is true on its own ("1 + 1 = 2" under "sin 30 = 1/2") and doesn't follow on from
+    the line above starts a new problem; it is not a wrong step of the old one."""
+    if len(p.parts) < 2 or any(e is None for e in p.parts) or not all(chain_kind(e) == "algebra" for e in p.parts):
+        return False
+    cmp = _Comparator(var, False, "algebra")
+    try:
+        if cmp.same(p.parts[0], prev):
+            return False
+        for a, b in zip(p.parts, p.parts[1:]):
+            deg = degree_reading(a)
+            if not (cmp.same(b, a) or (deg is not None and cmp.same(b, deg))):
+                return False
+    except Exception:
+        return False
+    return True
 
 
 def _equation_of(p: ParsedLine) -> sp.Expr | None:

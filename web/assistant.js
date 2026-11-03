@@ -354,7 +354,7 @@ export class MetaInk {
   freeRow(r, x, w, n = 1) {
     for (let k = r; k < r + 30 && rowY(k + n - 1) < PAGE_H - 10; k++) {
       let ok = true;
-      for (let j = 0; j < n && ok; j++) ok = this.isFree([x, rowY(k + j) - RULE + 8, w, RULE - 10]);
+      for (let j = 0; j < n && ok; j++) ok = this.isFree([x, rowY(k + j) - RULE + 2, w, RULE - 4]);   // whole row: "I read" labels sit high in it
       if (ok) return k;
     }
     return r;
