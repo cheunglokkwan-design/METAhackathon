@@ -367,44 +367,81 @@ selBar.onclick = e => {
   if (b.dataset.sel === 'convert') convertSelection();
   if (b.dataset.sel === 'more') { nb.clearSelection(); callMeta('more please, be more specific', 'hint', { escalate: true }); }
 };
-// ---- Refine handwriting (like Apple Notes' Refine): straighter rows, even letters and spacing, and a
-// letter Meta read for sure nudged towards a clean print letter. It stays the student's handwriting.
+// ---- Tidy handwriting (like Apple Notes / Samsung Notes): a letter we're sure about is redrawn as a
+// clean handwritten letter; everything else is only straightened, evened out and smoothed.
 const studentStrokes = items => items.filter(it => it.type === 'stroke' && !it.hl && !isMeta(it) && it.pts?.length > 1);
+let metaOnline = false, letterTipShown = false;
+try { letterTipShown = localStorage.getItem('margin.letterTip') === '1'; } catch { /* private mode */ }
+const tidied = new WeakSet();                       // strokes already tidied (and the letters we drew)
+// Applies refine()'s result; returns the strokes that now stand for `strokes` (redrawn letters swapped in).
 function applyRefined(strokes, res) {
   for (const s of strokes) { s.pts = res.pts.get(s).map(([x, y, p]) => [Math.round(x * 100) / 100, Math.round(y * 100) / 100, p]); nb.prepare(s); }
+  let out = [...strokes];
+  for (const rep of res.replace) {
+    const at = nb.items.indexOf(rep.items[0]);
+    if (at < 0 || !rep.items.every(it => nb.items.includes(it))) continue;
+    const proto = rep.items[0];
+    const fresh = rep.strokes.map(pts => nb.prepare({ type: 'stroke', color: proto.color, size: proto.size, sim: proto.sim,
+      pts: pts.map(([x, y, p]) => [Math.round(x * 100) / 100, Math.round(y * 100) / 100, p]) }));
+    fresh.forEach(f => tidied.add(f));
+    nb.items = nb.items.filter(it => !rep.items.includes(it));
+    nb.items.splice(Math.min(at, nb.items.length), 0, ...fresh);
+    out = out.filter(it => !rep.items.includes(it)).concat(fresh);
+  }
   nb.redraw(); scheduleSave();
+  if (res.replace.length && !letterTipShown) {
+    letterTipShown = true;
+    try { localStorage.setItem('margin.letterTip', '1'); } catch { /* private mode */ }
+    toast('Tidied your letters. Undo to keep them as written, or turn this off in ⋯ › Tidy my writing.', { label: 'Undo', fn: () => nb.undo() });
+  }
+  return out;
 }
+async function metaRead(strokes) {
+  if (!metaOnline || !strokes.length) return null;
+  try {
+    const r = await fetch('/api/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: nb.snapshotOf(strokes) }) });
+    return r.ok ? (await r.json()).lines || null : null;
+  } catch { return null; }
+}
+const whenIdle = fn => { const go = () => (nb.active || nb.cur ? setTimeout(go, 300) : fn()); go(); };
 async function refineSelection() {
   const strokes = studentStrokes(nb.sel);
   if (!strokes.length) { toast('Select some handwriting first.'); return; }
-  toast('Refining your writing…');
-  let texts = null;
-  try {
-    const r = await fetch('/api/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image: nb.snapshotOf(strokes) }) });
-    if (r.ok) texts = (await r.json()).lines || null;
-  } catch { /* offline: shape and spacing only */ }
+  toast('Tidying your writing…');
+  const texts = await metaRead(strokes);
   if (!strokes.every(s => nb.items.includes(s))) return;      // erased meanwhile
   nb.checkpoint();
   const res = refine(strokes, { texts });
   applyRefined(strokes, res);
   nb.clearSelection();
-  toast(res.letters ? `Refined. ${res.letters} unclear letter${res.letters === 1 ? '' : 's'} neatened.` : 'Refined.', { label: 'Undo', fn: () => nb.undo() });
+  toast(res.letters ? `Tidied. ${res.letters} letter${res.letters === 1 ? '' : 's'} redrawn clearly.` : 'Tidied.', { label: 'Undo', fn: () => nb.undo() });
 }
-// While "Tidy my writing" is on: after a short pause, gently straighten and space the words just written.
-let autoRefineT = null, refinedSeen = new WeakSet();
+// While "Tidy my writing" is on: a moment after the pen stops, tidy what was just written. Letters the
+// app is sure of are redrawn at once; then Meta reads the words and the letters it is sure of are redrawn too.
+let autoRefineT = null, metaBusy = false;
 function scheduleAutoRefine() {
   clearTimeout(autoRefineT);
   if (!tidyOn) return;
-  autoRefineT = setTimeout(() => {
-    if (nb.active || nb.cur) return;
-    const fresh = studentStrokes(nb.items).filter(s => !refinedSeen.has(s) && !s.shaped);
-    fresh.forEach(s => refinedSeen.add(s));
-    if (fresh.length < 3) return;
-    const res = refine(fresh, { strength: 0.6 });
-    if (res.rows !== 1) return;
+  autoRefineT = setTimeout(() => whenIdle(async () => {
+    const fresh = studentStrokes(nb.items).filter(s => !tidied.has(s) && !s.shaped);
+    if (!fresh.length) return;
+    fresh.forEach(s => tidied.add(s));
     nb.checkpoint();
-    applyRefined(fresh, res);
-  }, 1600);
+    let group = applyRefined(fresh, refine(fresh, { strength: 0.6 }));
+    if (metaBusy || group.length > 120) return;
+    metaBusy = true;
+    const texts = await metaRead(group);
+    metaBusy = false;
+    if (!texts?.length || !tidyOn) return;
+    whenIdle(() => {
+      group = group.filter(s => nb.items.includes(s));
+      if (!group.length) return;
+      const res = refine(group, { texts, strength: 0 });
+      if (!res.replace.length) return;
+      nb.checkpoint();
+      applyRefined(group, res);
+    });
+  }), 1400);
 }
 
 // Lasso › To text: Meta reads the selected handwriting and it becomes a typed text box in its place.
@@ -572,7 +609,7 @@ applyTidy();
 $$('[data-tidy]').forEach(b => b.onclick = () => {
   tidyOn = b.dataset.tidy === 'on'; applyTidy();
   try { localStorage.setItem('margin.tidy', tidyOn ? 'on' : 'off'); } catch { /* private mode */ }
-  toast(tidyOn ? 'Strokes are smoothed. Hold still at the end of a stroke to snap a shape.' : 'Your strokes stay exactly as drawn.');
+  toast(tidyOn ? 'Letters are tidied as you write. Hold still at the end of a stroke to snap a shape.' : 'Your strokes stay exactly as drawn.');
 });
 let shapeTipShown = false;
 try { shapeTipShown = localStorage.getItem('margin.shapeTip') === '1'; } catch { /* private mode */ }
@@ -952,6 +989,7 @@ fetch('/api/health').then(r => r.json()).then(h => {
   $('#status').textContent = h.offline ? 'Meta: offline mode (reads typed lines only)' : `Meta: online · ${h.model || ''}`;
   $('#status').dataset.ok = !h.offline;
   voice.serverOk = !h.offline; voice.realtime = !!h.realtime && !!window.WebSocket;
+  metaOnline = !h.offline;
 }).catch(() => { $('#status').textContent = 'Meta: server not reachable'; });
 
 // ---- offline app shell ---------------------------------------------------------------------------

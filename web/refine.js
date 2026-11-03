@@ -1,20 +1,15 @@
-// Refine handwriting, the way Apple Notes ("Refine") and Samsung Notes tidy it: the writing stays
-// the student's own. Nothing is swapped for a typed font.
-//   1. Each row is straightened onto its baseline, letters of about the same size are evened out,
-//      and the gaps between letters and words are evened out.
-//   2. Only when the letters are known for sure (Meta read the row, and the row has exactly one
-//      stroke group per letter, with the right number of strokes) is each letter blended part of
-//      the way towards a clean print letter. A messy C becomes a readable c that still looks
-//      handwritten. A letter that doesn't match its print shape closely enough is left alone.
+// Tidy handwriting automatically, the way Apple Notes and Samsung Notes do:
+//   1. A letter we're sure about is redrawn outright as a clean handwritten letter (a wobbly C
+//      becomes a clear c). "Sure" means Meta read it and the shape agrees, or, without Meta, the
+//      shape matches one letter closely and clearly better than any other.
+//   2. Everything else only gets the light touch: each row is straightened onto its baseline,
+//      letters of about the same size are evened out, gaps are evened out, and strokes are smoothed.
 // Works on stroke items ({ pts: [[x, y, p], ...] }); returns new point arrays and never mutates its input.
 
 import { PRINT_GLYPHS } from './vendor/writey/glyphs_print.js';
 import { smoothStroke } from './shapes.js';
 
 const N = 32;                      // points per stroke when comparing shapes
-const BLEND = 0.42;                // how far a recognised letter moves towards the print letter
-const MATCH = 0.3;                 // largest shape difference (in letter boxes) still counted as "sure"
-const NEAT = 0.06;                 // below this the letter is already neat: leave it
 
 const bboxOf = pts => {
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
@@ -120,61 +115,95 @@ const templateOf = ch => {
   return g[1].map(flat => { const p = []; for (let i = 0; i < flat.length; i += 2) p.push([flat[i], flat[i + 1], 0.5]); return p; });
 };
 
-// The print letter's strokes fitted to the student's letter box, paired with the student's strokes
-// (nearest centres, either direction); null if the stroke counts differ.
-function pairUp(strokes, tmpl, box) {
-  if (strokes.length !== tmpl.length) return null;
-  const tb = bboxOf(tmpl.flat());
-  const sy = box.h / Math.max(1, tb.h), sx = tb.w < 40 || box.w < 3 ? sy : box.w / tb.w;
-  const tcx = (tb.x0 + tb.x1) / 2, bcx = (box.x0 + box.x1) / 2;
-  const fit = tmpl.map(s => resample(s.map(([x, y]) => [bcx + (x - tcx) * sx, box.y0 + (y - tb.y0) * sy, 0.5])));
-  const mine = strokes.map(s => resample(s));
-  const c = s => [s.reduce((a, p) => a + p[0], 0) / s.length, s.reduce((a, p) => a + p[1], 0) / s.length];
-  const used = new Set(), pairs = [];
-  for (const m of mine) {
-    const cm = c(m);
-    let best = -1, bd = Infinity;
-    fit.forEach((t, i) => { if (used.has(i)) return; const ct = c(t), d = Math.hypot(ct[0] - cm[0], ct[1] - cm[1]); if (d < bd) { bd = d; best = i; } });
-    used.add(best);
-    const t = fit[best], rev = [...t].reverse();
-    const dist = s => s.reduce((a, p, i) => a + Math.hypot(p[0] - m[i][0], p[1] - m[i][1]), 0) / N;
-    const [tt, d] = dist(t) <= dist(rev) ? [t, dist(t)] : [rev, dist(rev)];
-    pairs.push({ m, t: tt, d: d / Math.max(box.w, box.h, 1) });
+// ---- recognising a letter: point clouds compared by chamfer distance ----------------------------
+
+// ~n points spread along the strokes, centred and scaled so the bigger side is 1 (aspect kept).
+function cloud(strokes, n = 48) {
+  const lens = strokes.map(s => s.reduce((a, p, i) => i ? a + Math.hypot(p[0] - s[i - 1][0], p[1] - s[i - 1][1]) : 0, 0));
+  const total = lens.reduce((a, b) => a + b, 0) || 1;
+  const pts = strokes.flatMap((s, i) => s.length < 2 ? [s[0]] : resample(s, Math.max(2, Math.round(n * lens[i] / total))));
+  const b = bboxOf(pts), k = 1 / Math.max(b.w, b.h, 1e-6), cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2;
+  return { pts: pts.map(([x, y]) => [(x - cx) * k, (y - cy) * k]), aspect: b.w / Math.max(b.h, 1e-6) };
+}
+function chamfer(a, b) {
+  const one = (p, q) => p.reduce((s, [x, y]) => s + Math.min(...q.map(([u, v]) => Math.hypot(x - u, y - v))), 0) / p.length;
+  return (one(a.pts, b.pts) + one(b.pts, a.pts)) / 2;
+}
+const CANDIDATES = [...'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789+-=()'];
+const clouds = new Map();
+const cloudOf = ch => { if (!clouds.has(ch)) { const t = templateOf(ch); clouds.set(ch, t ? cloud(t) : null); } return clouds.get(ch); };
+// letters that look the same apart from size (c and C, o O 0): picked between by height, not shape
+const family = ch => ({ o: 'o', O: 'o', 0: 'o', l: 'l', I: 'l', 1: 'l', '|': 'l' })[ch] ?? ch.toLowerCase();
+const SURE_META = 0.17;            // Meta named the letter and the shape agrees this well
+const SURE_APP = 0.085;            // no Meta: the best match must be this close...
+const MARGIN = 1.55;               // ...and clearly better than any different-looking letter
+
+// What letter this is, if we're sure: { ch, by } or null.
+export function recognise(strokes, metaCh = null, rowH = 0) {
+  const c = cloud(strokes), box = bboxOf(strokes.flat());
+  if (Math.max(box.w, box.h) < 6) return null;
+  const scored = CANDIDATES.map(ch => ({ ch, d: cloudOf(ch) ? chamfer(c, cloudOf(ch)) : Infinity })).sort((a, b) => a.d - b.d);
+  if (metaCh) {
+    // Meta's letter must fit the shape, and fit it about as well as the best-looking letter does
+    const t = cloudOf(metaCh), d = t ? chamfer(c, t) : Infinity;
+    const other = scored.find(x => family(x.ch) !== family(metaCh));
+    return d < SURE_META && (!other || d <= other.d * 1.1) ? { ch: metaCh, by: 'meta' } : null;
   }
-  return pairs;
+  const best = scored[0], rival = scored.find(x => family(x.ch) !== family(best.ch));
+  if (!(best.d < SURE_APP && (!rival || rival.d > best.d * MARGIN))) return null;
+  // size decides c / C and o / O / 0 the way a reader would
+  const tall = rowH && box.h > rowH * 1.3;
+  let ch = best.ch;
+  if (/[a-z]/i.test(ch) && ch.toLowerCase() !== ch.toUpperCase()) {
+    const lowerSameShape = 'cosuvwxz'.includes(ch.toLowerCase());
+    if (lowerSameShape) ch = tall ? ch.toUpperCase() : ch.toLowerCase();
+  }
+  if (family(ch) === 'o') ch = tall ? '0' : 'o';                  // maths pages: a tall round one is a zero
+  return { ch, by: 'app' };
 }
 
-function blendLetter(letter, ch, pts) {
+// The clean letter `ch` drawn into the student's letter box (height kept, centred), as stroke points.
+function cleanLetter(ch, box, pressure, spacing = 4) {
   const tmpl = templateOf(ch);
-  if (!tmpl) return false;
-  const strokes = letter.items.map(s => pts.get(s));
-  const box = bboxOf(strokes.flat());
-  if (box.w < 3 && box.h < 3) return false;
-  const pairs = pairUp(strokes, tmpl, box);
-  if (!pairs) return false;
-  const d = Math.max(...pairs.map(p => p.d));
-  if (d > MATCH || d < NEAT) return false;                       // not sure what it is, or already neat
-  letter.items.forEach((s, i) => {
-    const { m, t } = pairs[i];
-    pts.set(s, m.map((p, k) => [p[0] + (t[k][0] - p[0]) * BLEND, p[1] + (t[k][1] - p[1]) * BLEND, p[2]]));
+  const tb = bboxOf(tmpl.flat());
+  const k = tb.h > 40 ? box.h / tb.h : box.w / Math.max(tb.w, 1);
+  const tcx = (tb.x0 + tb.x1) / 2, tcy = (tb.y0 + tb.y1) / 2, bcx = (box.x0 + box.x1) / 2, bcy = (box.y0 + box.y1) / 2;
+  return tmpl.map(st => {
+    const pts = st.map(([x, y]) => [bcx + (x - tcx) * k, bcy + (y - tcy) * k, pressure]);
+    if (pts.length < 2) return pts;
+    // as many points as the student's pen would lay down over that length (point spacing sets how
+    // thick simulated-pressure ink looks)
+    const len = pts.reduce((a, p, i) => i ? a + Math.hypot(p[0] - pts[i - 1][0], p[1] - pts[i - 1][1]) : 0, 0);
+    return resample(pts, Math.max(4, Math.round(len / Math.max(1, spacing)) + 1));
   });
-  return true;
 }
 
 // ---- entry points -------------------------------------------------------------------------------
 
-// Map stroke -> refined points. `texts` (optional): what Meta read, one string per row, top to bottom.
-// strength 1 = the Refine button; auto-refine while writing uses a gentler 0.6 and no letters.
-export function refine(strokes, { texts = null, strength = 1 } = {}) {
+// Tidies `strokes`. Returns { pts: Map stroke -> new points, replace: [{ items, strokes }], rows, letters }:
+// `replace` lists letters recognised for sure, to be redrawn outright as a clean handwritten letter
+// (`strokes` = the new point lists). Everything else is only straightened, evened out and smoothed.
+// `texts` (optional): what Meta read, one string per row, top to bottom.
+export function refine(strokes, { texts = null, strength = 1, letters: doLetters = true } = {}) {
   const pts = new Map(strokes.map(s => [s, s.pts.map(p => [...p])]));
   const rows = rowsOf(strokes);
-  let letters = 0;
+  const replace = [];
   rows.forEach((row, r) => {
     geometry(row, pts, strength);
-    const chars = texts && texts.length === rows.length ? [...String(texts[r]).replace(/\s+/g, '')] : null;
+    if (!doLetters) return;
     const ls = lettersOf(row);
-    if (chars && chars.length === ls.length) ls.forEach((l, i) => { if (blendLetter(l, chars[i], pts)) letters++; });
+    const chars = texts && texts.length === rows.length ? [...String(texts[r]).replace(/\s+/g, '')] : null;
+    const metaFits = chars && chars.length === ls.length;
+    const rowH = median(ls.map(l => l.b.h));
+    for (const [i, l] of ls.entries()) {
+      const mine = l.items.map(s => pts.get(s));
+      const got = recognise(mine, metaFits && templateOf(chars[i]) ? chars[i] : null, ls.length > 1 ? rowH : 0);
+      if (!got) continue;
+      const p = median(mine.flat().map(q => q[2] ?? 0.5));
+      const gap = median(l.items.flatMap(s => s.pts.slice(1).map((q, i) => Math.hypot(q[0] - s.pts[i][0], q[1] - s.pts[i][1]))));
+      replace.push({ items: l.items, ch: got.ch, by: got.by, strokes: cleanLetter(got.ch, bboxOf(mine.flat()), p, gap) });
+    }
   });
   for (const s of strokes) pts.set(s, smoothStroke(pts.get(s), strength >= 1 ? 2 : 1));
-  return { pts, rows: rows.length, letters };
+  return { pts, replace, rows: rows.length, letters: replace.length };
 }

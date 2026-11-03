@@ -31,7 +31,32 @@ const clean = t => stripWake(t.replace(/\s+/g, ' ')).replace(/^[,.!?\s]+/, '');
 // webm/opus (Chrome) or mp4/aac (Safari). Decode the recording and write it out as WAV.
 // Speech is also trimmed (the 10 s of silence before the mic turns off is dropped) and brought up to a
 // clear level, since a quiet laptop mic can come back from Meta as "no words".
-export const QUIET_PEAK = 0.01;                      // below this the mic recorded silence
+export const QUIET_PEAK = 0.003;                     // below this the mic recorded silence
+
+// Is this speech? Quiet laptop mics and soft voices sit far below a fixed threshold, so the bar is
+// set from the room itself: a little above the background noise heard so far (it learns the floor
+// in the first half second and keeps following it), never below a tiny absolute minimum.
+export class SpeechGate {
+  constructor() { this.floor = null; this.n = 0; }
+  // rms: loudness of one short frame (0..1). Returns true when the frame is speech.
+  hear(rms) {
+    this.n++;
+    if (this.floor == null) this.floor = rms;
+    else if (rms < this.floor) this.floor = this.floor * 0.7 + rms * 0.3;     // quieter: follow down fast
+    else this.floor = this.floor * 0.995 + rms * 0.005;                      // louder: follow up slowly
+    return this.n > 3 && rms > Math.max(this.floor * 2.2, 0.004);
+  }
+}
+
+// Automatic gain for live audio: brings a quiet voice up to a clear level (up to 25x) without
+// clipping a loud one. Follows the recent peak, falling back slowly after loud sounds.
+export class Leveler {
+  constructor() { this.peak = 0.02; }
+  gainFor(framePeak) {
+    this.peak = Math.max(framePeak, this.peak * 0.97, 0.004);
+    return Math.max(1, Math.min(25, 0.6 / this.peak));
+  }
+}
 export async function toWav(blob) {
   const AC = window.AudioContext || window.webkitAudioContext;
   const ctx = new AC();
@@ -54,7 +79,7 @@ export async function toWav(blob) {
     while (first < n && Math.abs(mono[first]) < gate) first++;
     while (last > first && Math.abs(mono[last]) < gate) last--;
     const from = Math.max(0, first - pad), to = Math.min(n, last + pad + 1), len = Math.max(0, to - from);
-    const gain = peak > 0 ? Math.min(0.9 / peak, 30) : 1;   // up to 30x for a quiet mic
+    const gain = peak > 0 ? Math.min(0.9 / peak, 60) : 1;   // up to 60x for a quiet mic
     const out = new DataView(new ArrayBuffer(44 + len * 2));
     const str = (o, t) => [...t].forEach((ch, i) => out.setUint8(o + i, ch.charCodeAt(0)));
     str(0, 'RIFF'); out.setUint32(4, 36 + len * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
@@ -261,22 +286,26 @@ export class Voice {
         src = ctx.createMediaStreamSource(stream);
         proc = ctx.createScriptProcessor(2048, 1, 1);
         const step = ctx.sampleRate / LIVE_RATE;
+        const gate = new SpeechGate(), level = new Leveler();
         let pos = 0;
         proc.onaudioprocess = e => {
           const inp = e.inputBuffer.getChannelData(0);
           const n = Math.floor((inp.length - pos) / step);
           if (n <= 0 || ws.readyState !== 1) return;
-          const out = new Int16Array(n);
-          let peak = 0;
+          const mono = new Float32Array(n);
+          let peak = 0, sq = 0;
           for (let i = 0; i < n; i++) {
             const a = Math.floor(pos + i * step), b = Math.max(a + 1, Math.floor(pos + (i + 1) * step));
             let sum = 0; for (let j = a; j < b && j < inp.length; j++) sum += inp[j];
-            const v = Math.max(-1, Math.min(1, sum / (b - a)));
-            out[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+            const v = sum / (b - a);
+            mono[i] = v; sq += v * v;
             if (Math.abs(v) > peak) peak = Math.abs(v);
           }
           pos = pos + n * step - inp.length;
-          if (peak > 0.02) this.lastSpeech = Date.now();
+          if (gate.hear(Math.sqrt(sq / n))) this.lastSpeech = Date.now();
+          // a soft voice is turned up before Meta hears it, so nobody has to shout
+          const g = level.gainFor(peak), out = new Int16Array(n);
+          for (let i = 0; i < n; i++) { const v = Math.max(-1, Math.min(1, mono[i] * g)); out[i] = v < 0 ? v * 0x8000 : v * 0x7fff; }
           ws.send(out.buffer);
         };
         src.connect(proc); proc.connect(ctx.destination);   // Chrome only runs a connected processor
@@ -317,11 +346,11 @@ export class Voice {
     try {
       const src = ctx.createMediaStreamSource(stream), an = ctx.createAnalyser();
       an.fftSize = 1024; src.connect(an);
-      const buf = new Uint8Array(an.fftSize);
+      const buf = new Float32Array(an.fftSize), gate = new SpeechGate();
       const tick = () => {
-        an.getByteTimeDomainData(buf);
-        let sum = 0; for (const v of buf) sum += (v - 128) ** 2;
-        if (ctx.state === 'running' && Math.sqrt(sum / buf.length) > 6) this.lastSpeech = Date.now();
+        an.getFloatTimeDomainData(buf);
+        let sum = 0; for (const v of buf) sum += v * v;
+        if (ctx.state === 'running' && gate.hear(Math.sqrt(sum / buf.length))) this.lastSpeech = Date.now();
         raf = requestAnimationFrame(tick);
       };
       ctx.resume?.(); raf = requestAnimationFrame(tick);
