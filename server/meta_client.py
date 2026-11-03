@@ -187,11 +187,12 @@ def _client():
 def _err_detail(exc: Exception) -> str:
     """Meta's own short error message, if the reply had one."""
     body = getattr(exc, "body", None)
+    msg = None
     if isinstance(body, dict):
         msg = (body.get("error") or {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
-        if msg:
-            return str(msg)[:120]
-    return ""
+    elif isinstance(body, str) and body.strip():
+        msg = re.sub(r"<[^>]+>", " ", body)
+    return re.sub(r"\s+", " ", str(msg)).strip()[:120] if msg else ""
 
 
 def _complete(client, **kw):
@@ -205,6 +206,13 @@ def _complete(client, **kw):
             raise
         first = exc
     log.warning("Meta 404 for model %s at %s: %s", model, _working["base"] or base_url(), _err_detail(first) or "no body")
+    # Meta sometimes answers 404 for a moment even for a model that exists: try the same call once more.
+    time.sleep(1.0)
+    try:
+        return client.chat.completions.create(model=model, **kw)
+    except Exception as exc:
+        if getattr(exc, "status_code", None) != 404:
+            raise
     tries = []
     if (_working["base"] or base_url()).rstrip("/") != DEFAULT_BASE_URL and hasattr(client, "with_options"):
         tries.append((DEFAULT_BASE_URL, model))
@@ -372,8 +380,11 @@ def read_error_text(reason: str | None) -> str:
     if "too large" in r:
         return "the page picture was too big"
     if "error 404" in r:
-        return ("Meta couldn't find the model or the API address (check CHAT_MODEL and MODEL_BASE_URL "
-                "in the host's settings, or remove them)")
+        # Meta's own words, without the _ and ` that the handwriting would turn into subscripts
+        said = re.sub(r"[_`*^]", " ", (reason or "").split("(", 1)[1].rstrip(")")) if "(" in (reason or "") else ""
+        said = re.sub(r"\s+", " ", said).strip()
+        return ("Meta answered \"not found\" (404" + (f": {said}" if said else ", no details")
+                + "). It is often a short hiccup on Meta's side")
     if "error 5" in r:
         return "Meta's server had an error"
     if "connection" in r:

@@ -123,4 +123,23 @@ def test_404_everywhere_says_which_settings_to_check(monkeypatch):
     monkeypatch.setitem(meta_client._working, "model", None)
     assert meta_client.read_page(IMG) == []
     assert meta_client.last_read_error.startswith("Meta API error 404 (The model")
-    assert "CHAT_MODEL" in meta_client.read_error_text(meta_client.last_read_error)
+    text = meta_client.read_error_text(meta_client.last_read_error)
+    assert "404" in text and "does not exist" in text and "_" not in text and "`" not in text
+
+
+def test_a_passing_404_is_retried_with_the_same_model(monkeypatch):
+    seen = []
+
+    def create(**kw):
+        seen.append(kw["model"])
+        if len(seen) == 1:
+            raise NotFound(kw["model"])
+        msg = SimpleNamespace(content='{"lines": ["2 + 2 = 4"]}', tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")], usage=None)
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    _online(monkeypatch, fake)
+    monkeypatch.setattr(meta_client.time, "sleep", lambda s: None)
+    monkeypatch.setitem(meta_client._working, "model", None)
+    assert [l["text"] for l in meta_client.read_page(IMG)] == ["2 + 2 = 4"]
+    assert seen == ["muse-spark-1.3", "muse-spark-1.3"] and meta_client.chat_model() == "muse-spark-1.3"
