@@ -14,7 +14,8 @@ import time
 from typing import Any, Literal
 
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response as PlainResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -453,7 +454,7 @@ def refresh_token(req: RefreshRequest, request: Request, response: Response) -> 
     try:
         bundle = session_manager.refresh_session(raw_token, ip_address=ip, user_agent=ua)
     except AuthError as exc:
-        clear_auth_cookies(response)
+        clear_auth_cookies(response, request)
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
 
     set_auth_cookies(response, bundle, request)
@@ -476,7 +477,7 @@ def logout(
         ip_address=client_ip(request),
         user_agent=request.headers.get("user-agent", ""),
     )
-    clear_auth_cookies(response)
+    clear_auth_cookies(response, request)
     return {"ok": True}
 
 
@@ -494,7 +495,7 @@ def logout_all(
         ip_address=client_ip(request),
         user_agent=request.headers.get("user-agent", ""),
     )
-    clear_auth_cookies(response)
+    clear_auth_cookies(response, request)
     return {"ok": True, "revoked_sessions": count}
 
 
@@ -741,6 +742,45 @@ def get_ai_response(
     if not item:
         raise HTTPException(status_code=404, detail="AI interaction not found")
     return {"ai_response": item}
+
+
+# --------------------------------------------------------------------------- split hosting (Vercel page + Railway data)
+#
+# The page on Vercel can keep accounts and notebooks on another server (the Railway backend
+# with the database). The page learns that server's address from /api/config.js, which reads
+# MARGIN_API_URL (or NEXT_PUBLIC_API_URL, the name in the setup notes). Unset: same origin.
+
+DEFAULT_CORS_ORIGINS = "https://met-ahackathon.vercel.app"
+
+
+def data_api_url() -> str:
+    url = (os.getenv("MARGIN_API_URL") or os.getenv("NEXT_PUBLIC_API_URL") or "").strip().rstrip("/")
+    return url if url.startswith(("https://", "http://")) else ""
+
+
+def cors_origins() -> list[str]:
+    raw = os.getenv("CORS_ORIGINS", DEFAULT_CORS_ORIGINS)
+    return [o.strip().rstrip("/") for o in raw.split(",") if o.strip() and o.strip() != "*"]
+
+
+@app.get("/api/config.js", include_in_schema=False)
+def config_js() -> PlainResponse:
+    import json
+    body = f"window.MARGIN_API_URL = {json.dumps(data_api_url())};\n"
+    return PlainResponse(body, media_type="application/javascript",
+                         headers={"Cache-Control": "no-store"})
+
+
+# Outermost middleware, so error responses carry CORS headers too. Exact origins only: with
+# credentials allowed, a wildcard or loose pattern would let other sites read notebooks.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=cors_origins(),
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-CSRF-Token"],
+    max_age=600,
+)
 
 
 # Static page last, so /api/* wins. Tolerate web/ not existing yet.

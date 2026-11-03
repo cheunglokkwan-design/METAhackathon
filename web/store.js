@@ -78,6 +78,28 @@ async function del(store, key) {
 export const uid = () => (crypto.randomUUID?.() ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
 
 // ---- Cloud Auth, JWT Session Manager & Background DB Sync ------------------------------
+// Accounts and notebooks can live on another server (the Railway backend with the database)
+// while the page and Meta calls stay here. /api/config.js sets window.MARGIN_API_URL from the
+// host's MARGIN_API_URL / NEXT_PUBLIC_API_URL; empty means this same server.
+const API_BASE = (() => {
+  try {
+    const u = String(window.MARGIN_API_URL || '').trim().replace(/\/+$/, '');
+    return /^https?:\/\/[^/]+/.test(u) ? u : '';
+  } catch { return ''; }
+})();
+const DATA_PATH = /^\/api\/(auth|notebooks)(\/|\?|$)/;
+const OFFLINE_MSG = "Can't reach the Margin server right now. Your notebooks still save on this device.";
+
+// Account and notebook calls go to API_BASE with cookies (credentials: 'include'), and give up
+// after 15 s so a sleeping backend never hangs the page. Everything else is left as it was.
+function dataFetch(url, options = {}) {
+  if (!DATA_PATH.test(url)) return fetch(url, options);
+  const opts = { ...options, credentials: 'include' };
+  delete opts._retried;
+  if (!opts.signal && typeof AbortSignal !== 'undefined' && AbortSignal.timeout) opts.signal = AbortSignal.timeout(15000);
+  return fetch(API_BASE + url, opts);
+}
+
 const AUTH_STORAGE_KEY = 'margin.auth.session';
 let sessionState = null;
 try {
@@ -119,7 +141,7 @@ export const authClient = {
   },
 
   async fetchWithAuth(url, options = {}) {
-    const res = await fetch(url, { ...options, headers: this.headers(options.headers) });
+    const res = await dataFetch(url, { ...options, headers: this.headers(options.headers) });
     if (res.status === 401 && sessionState?.refresh_token && !options._retried) {
       const refreshed = await this.refresh();
       if (refreshed) return this.fetchWithAuth(url, { ...options, _retried: true });
@@ -128,11 +150,11 @@ export const authClient = {
   },
 
   async register(email, password, displayName = '') {
-    const r = await fetch('/api/auth/register', {
+    const r = await dataFetch('/api/auth/register', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: email.trim(), password, display_name: displayName.trim() }),
-    });
+    }).catch(() => { throw new Error(OFFLINE_MSG); });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(parseAuthError(data, r.status));
     saveSessionState(data);
@@ -140,11 +162,11 @@ export const authClient = {
   },
 
   async login(email, password) {
-    const r = await fetch('/api/auth/login', {
+    const r = await dataFetch('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: email.trim(), password }),
-    });
+    }).catch(() => { throw new Error(OFFLINE_MSG); });
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(parseAuthError(data, r.status));
     saveSessionState(data);
@@ -167,12 +189,13 @@ export const authClient = {
   async refresh() {
     if (!sessionState?.refresh_token) return false;
     try {
-      const r = await fetch('/api/auth/refresh', {
+      const r = await dataFetch('/api/auth/refresh', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ refresh_token: sessionState.refresh_token }),
       });
-      if (!r.ok) { saveSessionState(null); return false; }
+      if (r.status === 401 || r.status === 403) { saveSessionState(null); return false; }
+      if (!r.ok) return false;  // server busy or asleep: keep the session, try again later
       const data = await r.json();
       saveSessionState({ ...sessionState, ...data });
       return true;

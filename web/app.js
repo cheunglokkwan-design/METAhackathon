@@ -942,7 +942,8 @@ $('#toolbar-account')?.addEventListener('click', openAccountModal);
   await store.ready();
   updateAccountPill();
   if (!store.persistent) $('#storage-note').textContent = 'Storage is unavailable in this browser mode, so notebooks last until you close the tab.';
-  if (authClient.isAuthenticated()) await store.syncWithCloud();
+  // The data server may be asleep or far away: wait at most 4 s, then open the notebooks anyway.
+  if (authClient.isAuthenticated()) await Promise.race([store.syncWithCloud(), new Promise(r => setTimeout(r, 4000))]);
   await seed();
   await route();
 })();

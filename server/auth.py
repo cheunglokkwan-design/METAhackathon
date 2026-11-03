@@ -955,20 +955,34 @@ def client_ip(request: Request) -> str:
     return "127.0.0.1"
 
 
-def set_auth_cookies(response: Response, bundle: dict[str, Any], request: Request | None = None) -> None:
-    """Set hardened HttpOnly session cookies for browser clients."""
+def _cookie_policy(request: Request | None) -> tuple[bool, str]:
+    """(secure, samesite) for the session cookies.
+
+    The page may live on another site (Vercel page, Railway data), so over https the cookies are
+    SameSite=None, which browsers only accept with Secure. Writes still need X-CSRF-Token.
+    COOKIE_SAMESITE=lax|strict|none overrides.
+    """
     is_https = (
         os.getenv("ENV", "").lower() == "production"
         or (request is not None and request.url.scheme == "https")
         or (request is not None and request.headers.get("x-forwarded-proto") == "https")
     )
+    samesite = os.getenv("COOKIE_SAMESITE", "").lower() or ("none" if is_https else "lax")
+    if samesite not in ("lax", "strict", "none") or (samesite == "none" and not is_https):
+        samesite = "lax"
+    return is_https, samesite
+
+
+def set_auth_cookies(response: Response, bundle: dict[str, Any], request: Request | None = None) -> None:
+    """Set hardened HttpOnly session cookies for browser clients."""
+    secure, samesite = _cookie_policy(request)
     response.set_cookie(
         key=ACCESS_COOKIE_NAME,
         value=bundle["access_token"],
         max_age=ACCESS_TOKEN_TTL_SECONDS,
         httponly=True,
-        secure=is_https,
-        samesite="lax",
+        secure=secure,
+        samesite=samesite,
         path="/",
     )
     response.set_cookie(
@@ -976,16 +990,17 @@ def set_auth_cookies(response: Response, bundle: dict[str, Any], request: Reques
         value=bundle["refresh_token"],
         max_age=REFRESH_TOKEN_TTL_SECONDS,
         httponly=True,
-        secure=is_https,
-        samesite="lax",
+        secure=secure,
+        samesite=samesite,
         path="/api/auth",
     )
 
 
-def clear_auth_cookies(response: Response) -> None:
-    """Clear authentication cookies on logout."""
-    response.delete_cookie(ACCESS_COOKIE_NAME, path="/")
-    response.delete_cookie(REFRESH_COOKIE_NAME, path="/api/auth")
+def clear_auth_cookies(response: Response, request: Request | None = None) -> None:
+    """Clear authentication cookies on logout (same attributes, or a cross-site browser keeps them)."""
+    secure, samesite = _cookie_policy(request)
+    response.delete_cookie(ACCESS_COOKIE_NAME, path="/", secure=secure, httponly=True, samesite=samesite)
+    response.delete_cookie(REFRESH_COOKIE_NAME, path="/api/auth", secure=secure, httponly=True, samesite=samesite)
 
 
 def _extract_user_from_request(
@@ -1021,6 +1036,8 @@ def _extract_user_from_request(
             return None
         raise HTTPException(status_code=exc.status_code, detail=exc.message) from exc
     except DatabaseUnavailableError as exc:
+        if optional:  # e.g. /api/assist: a guest answer beats a 503 when the database is away
+            return None
         raise HTTPException(
             status_code=503,
             detail="Database temporarily unavailable (circuit breaker open)",
