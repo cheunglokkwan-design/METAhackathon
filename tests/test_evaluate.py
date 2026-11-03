@@ -16,8 +16,9 @@ def test_trailing_equals_is_a_request_not_an_error():
 
 
 def test_answer_and_next_step_work_it_out_in_degrees():
-    assert run("finish_answer", "30 sin 30 =") == [("write", "= 15"), ("note", "Taking 30 as degrees")]
-    assert run("next_step", "30*sin(30) =")[0] == ("write", "= 15")
+    assert run("finish_answer", "30 sin 30 =") == [("write", "= 30 × (1/2)"), ("write", "= 15"),
+                                                   ("note", "Taking 30 as degrees")]
+    assert run("next_step", "30*sin(30) =")[0] == ("write", "= 30 × (1/2)")
 
 
 def test_hints_build_up_to_the_value():
@@ -35,4 +36,8 @@ def test_referee_accepts_the_degree_answer_only():
 def test_other_values():
     assert checker.solve_remaining(checker.check_lines(["3 + 4 ="])) == ["= 7"]
     assert checker.solve_remaining(checker.check_lines(["sin(1) ="])) == ["≈ 0.8415"]
-    assert checker.solve_remaining(checker.check_lines(["2 cos 60 + tan 45 ="])) == ["= 2"]
+    assert checker.solve_remaining(checker.check_lines(["2 cos 60 + tan 45 ="])) == ["= 2 × (1/2) + 1", "= 2"]
+
+
+def test_working_steps_pass_the_referee():
+    assert [l.status for l in checker.check_lines(["30 sin 30 =", "= 30 × (1/2)", "= 15"]).lines] == ["start", "ok", "ok"]

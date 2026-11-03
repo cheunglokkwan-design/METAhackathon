@@ -468,16 +468,38 @@ def _latex_escape(t: str) -> str:
     return re.sub(r"([\\{}$&#%_^~])", r"\\\1", t)
 
 
+def _latex_unevaluated(raw: str) -> str:
+    """LaTeX of a worked value step exactly as written (30 × (1/2) stays unworked; SymPy would
+    multiply it out). Only the shapes value_steps writes: numbers, trig values, ×, + and -."""
+    t = raw.strip()
+    if not re.fullmatch(r"[0-9a-z()/×+\-. √]*", t):
+        raise ValueError("not a value step")
+    t = re.sub(r"\(?(-?(?:sqrt\(\d+\)|\d+)(?:\s*\w+)?)/(\d+)\)?", r"\\frac{\1}{\2}", t)
+    t = re.sub(r"sqrt\((\d+)\)", r"\\sqrt{\1}", t)
+    return t.replace("×", r"\times").replace("pi", r"\pi ")
+
+
 def latex_for_text(text: str) -> str:
     """LaTeX for an ink line written by the server (a `write`/`ghost` step).
 
     Keeps a leading "= " and a trailing "+ C". A part SymPy cannot read on its own (e.g.
     `f'(x)` without its definition line) is kept as \\text{...}, so the result is never empty.
     """
+    body = text.strip()
+    if re.fullmatch(r"[A-Za-z][a-z]*(?: [a-z]+)+", body):           # "No real solutions"
+        return rf"\text{{{body}}}"
+    if " or " in body:                                                # "x = 2 or x = 3"
+        return r" \text{ or } ".join(latex_for_text(b) for b in body.split(" or "))
+    if "×" in body:                                                   # "= 30 × (1/2)": keep it unworked
+        try:
+            lead = body.startswith("=")
+            parts = [_latex_unevaluated(b) for b in (body[1:] if lead else body).split("=")]
+            return ("= " if lead else "") + " = ".join(parts)
+        except Exception:
+            pass
     p = parse_line(text)
     if p.ok:
         return latex_of(p)
-    body = text.strip()
     lead = body.startswith("=")
     bits = []
     for raw in (body[1:] if lead else body).split("="):
@@ -930,6 +952,30 @@ def check_lines(lines: list[Any]) -> CheckResult:
         if p.defines:
             defs[p.defines] = (p.parts[0], p.var)
         head = p.parts[0]
+        eq = _equation_of(p)
+        if eq is not None and (prev is None or chain != "equation"):
+            # "x^2 - 5x + 6 = 0": an equation to solve starts here (not a wrong step)
+            prev = last_good = eq
+            var = _eq_var(eq, p.var)
+            chain, integral_chain, bracket_pending = "equation", False, False
+            res.status = "start"
+            continue
+        if eq is not None and chain == "equation":
+            # the next line of the solving: it must have the same solutions
+            if first_wrong is not None:
+                continue
+            if _same_roots(prev, eq, var):
+                prev = last_good = eq
+                res.status = "ok"
+            else:
+                res.status = "wrong"
+                res.diagnosis = Diagnosis("equation", "this equation has different solutions from the line above",
+                                          {1: "Check this step: the solutions changed",
+                                           2: "Do the same thing to both sides",
+                                           3: "Redo this step from the line above"})
+                res.wrong_part = 1
+                first_wrong, verdict = line_id, res.diagnosis.verdict
+            continue
         starts_new = not p.continuation and (
             prev is None or p.defines is not None or chain_kind(head) != "algebra")
         if starts_new:
@@ -1141,6 +1187,106 @@ def trig_values(expr: sp.Expr) -> list[str]:
     return out
 
 
+def _equation_of(p: ParsedLine) -> sp.Expr | None:
+    """lhs - rhs for a line like `2x + 3 = 7` or `x^2 - 5x + 6 = 0` (one side a constant, the other
+    with a variable, and not an identity); None for anything else."""
+    if p.continuation or p.defines or len(p.parts) != 2 or p.asks_value or any(e is None for e in p.parts):
+        return None
+    lhs, rhs = p.parts
+    if chain_kind(lhs) != "algebra" or chain_kind(rhs) != "algebra":
+        return None
+    if bool(lhs.free_symbols) == bool(rhs.free_symbols):
+        return None
+    try:
+        e = sp.expand(lhs - rhs)
+        if sp.simplify(e) == 0:
+            return None
+    except Exception:
+        return None
+    return e
+
+
+def _eq_var(e: sp.Expr, guess: sp.Symbol | None) -> sp.Symbol:
+    syms = sorted(e.free_symbols, key=str)
+    if guess in syms:
+        return guess
+    return X if X in syms else syms[0]
+
+
+def _roots(e: sp.Expr, var: sp.Symbol) -> set | None:
+    try:
+        sols = sp.solveset(e, var, domain=sp.S.Reals)
+    except Exception:
+        return None
+    if sols is sp.S.EmptySet:
+        return set()
+    return set(sols) if isinstance(sols, sp.FiniteSet) else None
+
+
+def _same_roots(a: sp.Expr, b: sp.Expr, var: sp.Symbol) -> bool:
+    ra, rb = _roots(a, var), _roots(b, var)
+    if ra is None or rb is None:
+        try:
+            return sp.simplify(a - b) == 0 or _const_ratio(a, b, var) is not None
+        except Exception:
+            return False
+    return {sp.nsimplify(r) for r in ra} == {sp.nsimplify(r) for r in rb}
+
+
+def solve_equation(e: sp.Expr, var: sp.Symbol) -> list[str]:
+    """Worked steps for an equation e = 0: factorised form (when it helps), then the solutions."""
+    steps: list[str] = []
+    try:
+        poly = e.is_polynomial(var)
+        deg = sp.degree(e, var) if poly else None
+        if deg == 1:
+            a, b = sp.Poly(e, var).all_coeffs()
+            if b != 0:
+                steps.append(f"{pretty(a * var)} = {pretty(-b)}")
+        elif poly and deg and deg >= 2:
+            f = sp.factor(e)
+            if f != e and f.is_Mul:
+                steps.append(f"{pretty(f)} = 0")
+        roots = _roots(e, var)
+        if roots is None:                     # periodic (sin x = 1/2): the solutions in one turn
+            try:
+                roots = {r for r in sp.solve(e, var) if r.is_real}
+            except Exception:
+                return steps
+            if not roots:
+                return steps
+        if not roots:
+            return steps + ["No real solutions"]
+        steps.append(" or ".join(f"{var} = {pretty(r)}" for r in sorted(roots, key=lambda r: float(r))))
+    except Exception:
+        return steps
+    return steps
+
+
+def value_steps(expr: sp.Expr, asked: bool) -> list[str]:
+    """Worked steps for a value: trig values put in first (sin 30° = 1/2), then the result."""
+    ev = evaluate_value(expr, asked)
+    if not ev:
+        return []
+    out = []
+    deg = degree_reading(expr)
+    if deg is not None:
+        calls = sorted((f for f in expr.atoms(*TRIG) if f.args[0].is_number), key=str)
+        marks = {f: sp.Symbol(f"TRIGV{i}") for i, f in enumerate(calls)}
+        try:
+            mid = "= " + pretty(expr.xreplace(marks))
+            for f, m in marks.items():
+                v = sp.simplify(f.func(f.args[0] * sp.pi / 180))
+                vt = pretty(v)
+                wrapped = vt if (v.is_Integer or v.is_Symbol) else f"({vt})"
+                mid = re.sub(rf"(?<=[0-9)])\s*{m.name}", f" × {wrapped}", mid).replace(m.name, vt)
+        except Exception:
+            mid = ""
+        if mid and mid.split(" ≈ ")[0] != ev[0].split(" ≈ ")[0]:
+            out.append(mid)
+    return out + [ev[0]]
+
+
 def solve_remaining(lines: list[Any]) -> list[str]:
     """Steps (as ink text, each starting with '=') that finish the last problem.
 
@@ -1155,10 +1301,11 @@ def solve_remaining(lines: list[Any]) -> list[str]:
         return _solve_derivative(value, var)
     if res.chain == "definite":
         return _solve_definite(value, var, res.bracket_pending)
+    if res.chain == "equation":
+        return solve_equation(value, var)
     if not res.integral_chain:
         asked = bool(res.lines) and res.lines[-1].parsed.asks_value
-        ev = evaluate_value(value, asked)
-        return [ev[0]] if ev else []
+        return value_steps(value, asked)
     if not value.has(sp.Integral):
         return []
     had_log = any(i.function.has(sp.log) for i in value.atoms(sp.Integral))
@@ -1196,6 +1343,16 @@ def next_step_hints(res: CheckResult) -> dict[int, str] | None:
         return None
     if res.chain == "derivative":
         return _derivative_hints(res)
+    if res.chain == "equation":
+        steps = solve_remaining(res)
+        nxt = f"Next: {steps[0]}" if steps else "Solve for " + str(var)
+        if value.is_polynomial(var) and sp.degree(value, var) == 2:
+            if sp.factor(value).is_Mul:
+                return {1: "Try factorising", 2: "Find two numbers that multiply and add to the right values", 3: nxt}
+            if sp.Poly(value, var).coeff_monomial(var) == 0:
+                return {1: f"Get {var}² on its own", 2: "Then take the square root of both sides (±)", 3: nxt}
+            return {1: "Use the quadratic formula", 2: "x = (−b ± √(b² − 4ac)) / 2a", 3: nxt}
+        return {1: f"Get {var} on its own", 2: "Do the same thing to both sides", 3: nxt}
     if res.chain == "definite":
         steps = solve_remaining(res)
         if res.bracket_pending and steps:

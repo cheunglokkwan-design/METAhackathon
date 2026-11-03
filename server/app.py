@@ -113,6 +113,10 @@ class AssistRequest(BaseModel):
     notebook_id: str | None = Field(default=None, max_length=64)
     page_id: str | None = Field(default=None, max_length=64)
     use_cache: bool = False
+    # Short-term memory: the page sends back the lines Meta read last time (as `lines`) when the
+    # student's writing hasn't changed, plus the last few turns, so a follow-up skips the rescan.
+    from_memory: bool = False
+    history: list[dict[str, str]] = Field(default_factory=list, max_length=6)
 
 
 class RegisterRequest(BaseModel):
@@ -221,6 +225,8 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
     level = max(1, min(3, int(req.hint_level or 1)))
     lines, from_image = _gather_lines(req)
     trace: list[dict[str, str]] = []
+    if req.from_memory and lines:
+        trace.append({"tool": "memory", "summary": f"remembered the page ({len(lines)} line(s)), no rescan"})
     if from_image:
         why = meta_client.last_read_error
         trace.append({"tool": "read_page", "summary": (f"read {len(lines)} line(s) from the page" if lines
@@ -258,7 +264,7 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
         out = router.route(req.command, box, req.image if from_image else None, session, spark=not offline)
     elif not offline:
         out = meta_client.run_agent(req.command, lines, req.image if from_image else None,
-                                    hint_level=level, toolbox=box)
+                                    hint_level=level, toolbox=box, history=req.history)
     if out is None:
         intent = meta_client.keyword_intent(req.command)
         why = "offline" if offline else "agent unavailable"

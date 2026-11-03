@@ -506,7 +506,13 @@ def keyword_intent(command: str) -> str:
         return "next"
     if WHY_RE.search(c):
         return "why"
-    if any(k in c for k in ("answer", "solution", "solve it", "finish", "just give", "show me how", "do it for me")):
+    if re.search(r"\b(help|hint|stuck)\b", c) and not re.search(r"answer|working|solution|all the steps", c):
+        return "hint"                                      # "help me solve this" wants a nudge
+    if re.search(r"\bcheck|is (?:this|it) right|am i right", c) and not re.search(r"answer|solution|solve", c):
+        return "check"                                     # "check my working"
+    if any(k in c for k in ("answer", "solution", "solve", "finish", "just give", "show me how", "do it for me",
+                            "working", "workings", "work it out", "all the steps", "the steps", "full steps",
+                            "step by step", "step-by-step", "show steps", "show the steps")):
         return "answer"
     if any(k in c for k in ("check", "is this right", "am i right", "correct?", "verify")):
         return "check"
@@ -539,7 +545,8 @@ Pick the tool(s) that match the request, usually exactly one:
 - what's next / next step / continue -> next_step (writes one step only)
 - why / explain / how does this work -> explain_rule
 - is this right / check -> check_steps
-- just give me the answer / finish it -> finish_answer
+- just give me the answer / finish it / solve it / show the working / all the steps -> finish_answer
+  (it writes every remaining step as working, each one checked by the referee)
 - tidy / typeset / neat -> typeset_lines
 - graph / plot / sketch -> sketch_graph
 - check by differentiating -> differentiate_check
@@ -570,8 +577,20 @@ def _tool_calls_of(msg: Any) -> list[tuple[str, str, dict[str, Any]]]:
     return out
 
 
+def history_text(history: list[dict[str, Any]] | None) -> str:
+    """Earlier turns about the same work, oldest first: 'Student: why? -> Meta: wrote a why-note'."""
+    rows = []
+    for h in (history or [])[-4:]:
+        said, did = str(h.get("command") or "")[:120].strip(), str(h.get("did") or "")[:160].strip()
+        if said or did:
+            rows.append(f"- Student: {said or '(button)'} -> Margin: {did or 'wrote on the page'}")
+    return ("Earlier in this conversation about the same work (the page has not changed since):\n"
+            + "\n".join(rows)) if rows else ""
+
+
 def run_agent(command: str, lines: list[dict[str, Any]], image: str | None = None,
-              hint_level: int = 1, toolbox: Any = None) -> dict[str, Any] | None:
+              hint_level: int = 1, toolbox: Any = None,
+              history: list[dict[str, Any]] | None = None) -> dict[str, Any] | None:
     """Muse Spark picks tools; each runs locally (server.skills) and its result feeds back.
 
     At most AGENT_MAX_ITERS model calls. The page's annotations come only from tool
@@ -589,7 +608,9 @@ def run_agent(command: str, lines: list[dict[str, Any]], image: str | None = Non
     from .skills import TOOL_SPECS, Toolbox  # local import: skills imports this module
 
     box = toolbox or Toolbox(lines, hint_level)
-    user: list[dict[str, Any]] = [{"type": "text", "text": f"Student said: {command or '(nothing)'}\n"
+    past = history_text(history)
+    user: list[dict[str, Any]] = [{"type": "text", "text": (past + "\n\n" if past else "")
+                                   + f"Student said: {command or '(nothing)'}\n"
                                    f"Page lines:\n{_page_text(lines) or '(none)'}"}]
     if image and len(image.strip()) <= MAX_IMAGE_CHARS and _DATA_IMAGE_RE.match(image.strip()):
         user.append({"type": "image_url", "image_url": {"url": image.strip()}})

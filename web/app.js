@@ -548,6 +548,17 @@ nb.onShape = kind => {
 let handPref = 'print';
 try { if (localStorage.getItem('margin.handStyle') === 'cursive') handPref = 'cursive'; } catch { /* private mode */ }
 setHandStyle(handPref);
+// Meta's writing size: S / M / L (a multiplier on "as big as the student's writing").
+let inkSize = 0.85;
+try { const v = parseFloat(localStorage.getItem('margin.inkSize')); if ([0.7, 0.85, 1].includes(v)) inkSize = v; } catch { /* private mode */ }
+meta.inkScale = inkSize;
+const syncSizeSeg = () => $$('[data-inksize]').forEach(b => b.setAttribute('aria-pressed', +b.dataset.inksize === inkSize));
+syncSizeSeg();
+$$('[data-inksize]').forEach(b => b.onclick = () => {
+  inkSize = +b.dataset.inksize; meta.inkScale = inkSize; syncSizeSeg();
+  try { localStorage.setItem('margin.inkSize', String(inkSize)); } catch { /* private mode */ }
+  toast({ 0.7: 'Meta now writes small.', 0.85: 'Meta now writes a bit smaller than you.', 1: 'Meta now writes as big as you.' }[inkSize]);
+});
 const syncHandSeg = () => $$('[data-hand]').forEach(b => b.setAttribute('aria-pressed', b.dataset.hand === handPref));
 syncHandSeg();
 $$('[data-hand]').forEach(b => b.onclick = () => {
@@ -599,6 +610,10 @@ page.addEventListener('pointerdown', dismissCoach, { once: true });
 
 // ---- calling Meta ------------------------------------------------------------------------
 let busy = false, hintMemo = null, lastReadLines = [];
+// Short-term memory: what Meta read from this page last time and the last few turns. A follow-up
+// ("why?", "more", "show working") reuses it instead of rescanning, until the student's writing changes.
+let readMemo = null;
+const memoFor = (pageId, sig) => readMemo && readMemo.page === pageId && readMemo.sig === sig ? readMemo : null;
 const touchOnly = () => matchMedia('(hover: none)').matches;
 
 function nextHintLevel(lines, sig, escalate) {
@@ -631,7 +646,10 @@ async function callMeta(command, mode = 'auto', { escalate = false, hintLevel = 
     notebook_id: state.book?.id || null,
     page_id: pageId,
   };
-  if (!overrideLines && (nb.hasStrokes() || nb.hasImages())) { payload.image = nb.snapshot(); payload.ink_rows = nb.inkRows(); }
+  const memo = !overrideLines && !lines.length ? memoFor(pageId, sig) : null;
+  if (memo) {
+    payload.lines = memo.lines; payload.from_memory = true; payload.history = memo.history.slice(-4);
+  } else if (!overrideLines && (nb.hasStrokes() || nb.hasImages())) { payload.image = nb.snapshot(); payload.ink_rows = nb.inkRows(); }
 
   busy = true;
   showReading(true);
@@ -639,6 +657,11 @@ async function callMeta(command, mode = 'auto', { escalate = false, hintLevel = 
     const resp = await assist(payload);
     if (current()?.id !== pageId) return;           // the student turned the page meanwhile
     lastReadLines = resp.lines?.length ? resp.lines : lines;
+    const did = (resp.agent_trace || []).filter(t => t.tool !== 'read_page' && t.tool !== 'memory').map(t => t.summary).join('; ').slice(0, 160);
+    if ((payload.image || memo) && resp.lines?.length) {
+      const keep = memo ? memo.lines : resp.lines.map(({ id, text, bbox }) => ({ id, text, bbox: bbox || null }));
+      readMemo = { page: pageId, sig, lines: keep, history: [...(memo?.history || []), { command: command || mode, did }].slice(-4) };
+    } else if (!memo) readMemo = null;
     showReading('writing');
     showTrace(resp.agent_trace);
     const wrong = resp.first_wrong && ((resp.lines || []).find(l => l.id === resp.first_wrong) || lines.find(l => l.id === resp.first_wrong));
@@ -674,6 +697,7 @@ function runQueued() {
 const plural = (n, w) => `${n} ${w}${n === '1' ? '' : 's'}`;
 const TRACE_WORDS = {
   read_page: () => 'read page',
+  memory: () => 'remembered page',
   check_steps: s => { const w = /(L\d+) wrong/.exec(s); return w ? `checked steps (${w[1]} wrong)` : 'checked steps'; },
   give_hint: () => 'wrote hint',
   finish_answer: s => { const n = /wrote (\d+)/.exec(s)?.[1]; return n ? `wrote ${plural(n, 'step')}` : 'wrote answer'; },

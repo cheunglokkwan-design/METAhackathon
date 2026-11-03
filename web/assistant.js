@@ -554,7 +554,8 @@ export class MetaInk {
   // ---- annotations -------------------------------------------------------------
   box(id) { const b = this.byId.get(id)?.bbox; return Array.isArray(b) && b.length === 4 ? b : null; }
   lastBox() { return [...this.byId.values()].map(l => l.bbox).filter(b => b?.length === 4).sort((a, b) => (a[1] + a[3]) - (b[1] + b[3])).at(-1) || null; }
-  emFor(b) { return emFor(b?.[3] ?? 32); }                            // Meta writes as big as the student
+  // Meta writes about as big as the student, times the "Meta's writing size" setting (S 0.7, M 0.85, L 1).
+  emFor(b) { const k = this.inkScale || 0.85; return Math.max(14, emFor(b?.[3] ?? 32) * k); }
 
   // Rows a box needs and where its baseline goes when it starts on ruled row r.
   rowsFor(box, em) {
@@ -721,7 +722,9 @@ export class MetaInk {
     const b = this.box(a.target) || this.lastBox();
     const m = this.mark('note');
     m.g.setAttribute('aria-label', a.text);
-    const em = this.emFor(b), px = Math.round(em * 0.9), lead = em * 1.2;
+    let em, px, lead;
+    const setEm = e => { em = e; px = Math.round(e * 0.9); lead = e * 1.2; };
+    setEm(this.emFor(b));
     const fontLines = maxPx => String(a.text).split('\n').flatMap(t => wrap(t, px, maxPx)).map(t => ({ t, box: null, w: measure(t, px) }));
     const linesFor = maxPx => this.noteLines(a, em, maxPx)?.map(bx => ({ t: '', box: bx, w: bx.w * em })) || fontLines(maxPx);
     const writeAll = async (lines, x, bases) => {
@@ -739,12 +742,21 @@ export class MetaInk {
     }
     const right = b[0] + b[2] + 60, avail = PAGE_W - 28 - right;
     let lines, x, bases, from, to, ctrl;
-    const rightLines = avail > 60 ? linesFor(avail) : [];
-    const rightW = rightLines.length ? Math.max(...rightLines.map(l => l.w)) : 0;
-    const rightH = rightLines.reduce((h, l) => h + (l.box ? Math.max(lead, (l.box.h + l.box.d + 0.25) * em) : lead), 0);
-    const rightFree = rightLines.length && this.isFree([right - 30, b[1] - 4, rightW + 30, rightH + 8]);
-    const full = rightLines.reduce((s, l) => s + l.w, 0);
-    if (a.side !== 'below' && avail >= Math.min(full, 220) && rightFree) {
+    // Beside the line when it fits; if not, try smaller writing (down to 3/4) before going below.
+    let rightLines = [], fitsRight = false;
+    const em0 = em;
+    for (const k of [1, 0.85, 0.75]) {
+      setEm(Math.max(13, em0 * k));
+      rightLines = avail > 60 ? linesFor(avail) : [];
+      const rightW = rightLines.length ? Math.max(...rightLines.map(l => l.w)) : 0;
+      const rightH = rightLines.reduce((h, l) => h + (l.box ? Math.max(lead, (l.box.h + l.box.d + 0.25) * em) : lead), 0);
+      const rightFree = rightLines.length && this.isFree([right - 30, b[1] - 4, rightW + 30, rightH + 8]);
+      const full = rightLines.reduce((s, l) => s + l.w, 0);
+      fitsRight = a.side !== 'below' && avail >= Math.min(full, 220) && rightFree && rightH <= Math.max(b[3] * 2.2, lead * 3.2);
+      if (fitsRight || a.side === 'below') break;
+    }
+    if (!fitsRight) setEm(em0);
+    if (fitsRight) {
       lines = rightLines; x = right;
       const base = b[1] + b[3] * 0.75;
       bases = [base];
@@ -819,7 +831,8 @@ export class MetaInk {
     const items = this.tsAnns.map(a => {
       const b = this.box(a.target);
       const bx = this.box_(() => mathBox(a.text ? toLatex(a.text) : a.latex)) || (a.latex ? this.box_(() => mathBox(a.latex)) : null);
-      let em = Math.round(clamp(b[3] * 0.95, 22, 32));
+      const k = this.inkScale || 0.85;
+      let em = Math.round(clamp(b[3] * 0.95, 22, 32) * Math.min(1, k + 0.1));
       if (bx) em = Math.min(em, (RULE + 8) / Math.max(0.5, bx.h + bx.d));
       const px = Math.round(clamp(b[3] * 0.78, 20, 27));
       return { a, b, bx, em, px, w: bx ? bx.w * em : measureMath(a.text || '', px), h: bx ? bx.h * em : px * 0.85 };
