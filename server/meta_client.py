@@ -184,6 +184,33 @@ def _client():
     return OpenAI(base_url=_working["base"] or base_url(), api_key=api_key(), timeout=30.0, max_retries=1)
 
 
+def diagnose() -> dict[str, Any]:
+    """What the Meta API says right now: the models this key can use, and one tiny text call and one
+    tiny image call with the model in use. No secrets in the answer."""
+    out: dict[str, Any] = {"base": _working["base"] or base_url(), "model": chat_model(), "offline": is_offline()}
+    client = _client()
+    if client is None:
+        return out
+    if not rate_limiter.allow():
+        out["busy"] = "rate limit reached, try again in a minute"
+        return out
+    try:
+        out["models"] = sorted(m.id for m in client.models.list())
+    except Exception as exc:
+        out["models_error"] = f"{getattr(exc, 'status_code', None) or type(exc).__name__}: {_err_detail(exc) or str(exc)[:120]}"
+    dot = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+    for name, content in (("text", "Reply with the word OK."),
+                          ("image", [{"type": "text", "text": "Reply with the word OK."},
+                                     {"type": "image_url", "image_url": {"url": dot}}])):
+        try:
+            r = client.chat.completions.create(model=chat_model(), max_tokens=400,
+                                               messages=[{"role": "user", "content": content}])
+            out[name] = f"ok: {(r.choices[0].message.content or '').strip()[:40]!r}"
+        except Exception as exc:
+            out[name] = f"{getattr(exc, 'status_code', None) or type(exc).__name__}: {_err_detail(exc) or str(exc)[:160]}"
+    return out
+
+
 def _err_detail(exc: Exception) -> str:
     """Meta's own short error message, if the reply had one."""
     body = getattr(exc, "body", None)

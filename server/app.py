@@ -301,6 +301,12 @@ async def voice_ws(ws: WebSocket) -> None:
     await realtime.voice_socket(ws)
 
 
+@app.get("/api/health/meta")
+def health_meta() -> dict[str, Any]:
+    """Asks Meta directly: which models this key can use, and whether a tiny text and image call work."""
+    return meta_client.diagnose()
+
+
 @app.get("/api/health/db")
 def health_db() -> dict[str, Any]:
     db_status = db.health_check()
