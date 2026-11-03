@@ -61,4 +61,26 @@ def test_ink_rows_give_boxes_and_failure_reason_reaches_page(monkeypatch):
     r = client.post("/api/assist", json={"image": IMG, "command": "help"}).json()
     assert r["read_error"].startswith("empty reply")
     assert "read nothing: empty reply" in r["agent_trace"][0]["summary"]
-    assert r["annotations"][0]["text"] == "I couldn't read the page just now. Try again?"
+    assert r["annotations"][0]["text"] == "I couldn't read the page: Meta ran out of thinking room. Try again?"
+
+
+def test_a_timeout_is_retried_once_and_explained(monkeypatch):
+    class Slow(FakeClient):
+        fails = 1
+
+        def create(self, **kw):
+            if self.fails:
+                self.fails -= 1
+                raise TimeoutError("read timed out")
+            return super().create(**kw)
+
+    _online(monkeypatch, Slow([('{"lines": ["30 sin 30 ="]}', "stop")]))
+    assert [l["text"] for l in meta_client.read_page(IMG)] == ["30 sin 30 ="]
+
+    class Dead(FakeClient):
+        def create(self, **kw):
+            raise TimeoutError("read timed out")
+
+    _online(monkeypatch, Dead([]))
+    assert meta_client.read_page(IMG) == []
+    assert meta_client.read_error_text(meta_client.last_read_error) == "Meta took too long to answer"

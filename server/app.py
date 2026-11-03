@@ -237,7 +237,7 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
         if offline:
             text = "I can't read ink offline: type the line (T tool)"
         elif why and why != "Meta saw no math on the page":
-            text = "I couldn't read the page just now. Try again?"
+            text = f"I couldn't read the page: {meta_client.read_error_text(why)}. Try again?"
         else:
             text = "I couldn't find any math on this page"
         return {"mode": mode, "offline": offline, "lines": [], "first_wrong": None,

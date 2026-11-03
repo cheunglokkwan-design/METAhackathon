@@ -303,6 +303,29 @@ def read_handwriting(image_dataurl: str) -> list[str]:
 # Muse Spark is a reasoning model: thinking tokens count against max_tokens, so a small budget
 # can end with an empty answer (finish_reason "length"). Give page reading plenty of room.
 READ_MAX_TOKENS = int(os.getenv("READ_MAX_TOKENS", "8000"))
+READ_TIMEOUT_S = float(os.getenv("READ_TIMEOUT_S", "55"))
+
+
+def read_error_text(reason: str | None) -> str:
+    """Why Meta couldn't read the page, in words a student understands."""
+    r = (reason or "").lower()
+    if "timeout" in r:
+        return "Meta took too long to answer"
+    if "429" in r or "rate limit" in r:
+        return "too many requests at once, wait a few seconds"
+    if "paused" in r:
+        return "Meta had errors, so it's paused for a minute"
+    if "401" in r or "403" in r:
+        return "the Meta API key was refused"
+    if "empty reply" in r:
+        return "Meta ran out of thinking room"
+    if "too large" in r:
+        return "the page picture was too big"
+    if "error 5" in r:
+        return "Meta's server had an error"
+    if "connection" in r:
+        return "couldn't reach Meta"
+    return reason or "unknown error"
 
 # Why the last read_page call found nothing, for the page's agent trace (None when it worked).
 last_read_error: str | None = None
@@ -321,13 +344,22 @@ def _chat_full(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str | N
     if not rate_limiter.allow():
         circuit_breaker.cancel_probe()
         return None, "rate limit reached"
-    try:
-        resp = client.chat.completions.create(model=CHAT_MODEL, messages=messages, max_tokens=max_tokens)
-    except Exception as exc:
-        circuit_breaker.record_failure()
-        status = getattr(exc, "status_code", None)
-        log.warning("read_page: Meta API error %s: %s", status, str(exc)[:300])
-        return None, f"Meta API error {status or type(exc).__name__}"
+    resp = None
+    for attempt in range(2):
+        try:
+            # Reading handwriting is a reasoning call: give it more time than the 30 s default.
+            c = client.with_options(timeout=READ_TIMEOUT_S, max_retries=0) if hasattr(client, "with_options") else client
+            resp = c.chat.completions.create(
+                model=CHAT_MODEL, messages=messages, max_tokens=max_tokens)
+            break
+        except Exception as exc:
+            status = getattr(exc, "status_code", None)
+            log.warning("read_page: Meta API error %s (try %d): %s", status, attempt + 1, str(exc)[:300])
+            transient = status is None or status == 429 or status >= 500
+            if attempt == 0 and transient:
+                continue                                   # one more try for timeouts and server errors
+            circuit_breaker.record_failure()
+            return None, f"Meta API error {status or type(exc).__name__}"
     circuit_breaker.record_success()
     choice = resp.choices[0]
     text = (choice.message.content or "").strip()
