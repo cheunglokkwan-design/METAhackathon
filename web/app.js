@@ -11,7 +11,7 @@ import { Shelf } from './shelf.js';
 import { Sidebar } from './pages.js';
 import { Zoom } from './zoom.js';
 import { exportPNG, exportPDF, paintPaper } from './export.js';
-import { toast, confirmDialog, notebookDialog, editReadDialog, closePopover } from './ui.js';
+import { toast, confirmDialog, accountDialog, notebookDialog, editReadDialog, userInitials, closePopover } from './ui.js';
 
 const $ = s => document.querySelector(s);
 const $$ = s => [...document.querySelectorAll(s)];
@@ -580,6 +580,7 @@ menu.onclick = e => {
   if (act === 'demo') demo();
   if (act === 'clear-meta') clearMeta();
   if (act === 'hide-meta') setMetaHidden(!nb.metaHidden);
+  if (act === 'account') openAccountModal();
   if (act === 'export-png') exportCurrentPNG();
   if (act === 'export-pdf') exportNotebookPDF();
 };
@@ -997,10 +998,56 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
   addEventListener('load', () => navigator.serviceWorker.register('sw.js').then(r => r.update()).catch(err => console.info('[margin] no service worker', err)));
 }
 
+function updateAccountPill() {
+  const authed = authClient.isAuthenticated();
+  const u = authClient.user;
+  const shortName = authed ? (u?.display_name?.trim()?.split(/\s+/)[0] || u?.email?.split('@')[0] || 'Account') : 'Sign in';
+  const initials = authed ? userInitials(u) : '';
+  for (const [btnId, lblId, avId] of [
+    ['#account-btn', '#account-label', '#account-avatar'],
+    ['#toolbar-account', '#toolbar-account-label', '#toolbar-account-avatar'],
+  ]) {
+    const btn = $(btnId), lbl = $(lblId), av = $(avId);
+    if (!btn || !lbl || !av) continue;
+    btn.classList.toggle('is-authed', authed);
+    btn.setAttribute('aria-pressed', authed);
+    lbl.textContent = shortName;
+    if (authed) av.textContent = initials;
+    else av.innerHTML = '<svg><use href="#i-user"/></svg>';
+  }
+  const mTitle = $('#menu-account-title'), mSub = $('#menu-account-sub');
+  if (mTitle && mSub) {
+    mTitle.textContent = authed ? `Account (${u?.display_name || shortName})` : 'Cloud account & sync';
+    mSub.textContent = authed ? `${u?.email || ''} · Cloud synced` : 'Back up notebooks across devices';
+  }
+}
+async function openAccountModal() {
+  const res = await accountDialog(authClient, {
+    onSync: async () => {
+      const ok = await store.syncWithCloud();
+      if (ok) { shelf.render(); }
+    },
+  });
+  updateAccountPill();
+  if (res === 'authenticated') {
+    const u = authClient.user;
+    toast(`Signed in as ${u?.display_name || u?.email || 'your account'}. Notebooks synced.`);
+  } else if (res === 'synced') {
+    toast('Notebooks synced to the cloud.');
+  } else if (res === 'logout') {
+    toast('Signed out of cloud sync.');
+  }
+}
+$('#account-btn')?.addEventListener('click', openAccountModal);
+$('#toolbar-account')?.addEventListener('click', openAccountModal);
+
 // ---- start ------------------------------------------------------------------------------------------
 (async () => {
   await store.ready();
+  updateAccountPill();
   if (!store.persistent) $('#storage-note').textContent = 'Storage is unavailable in this browser mode, so notebooks last until you close the tab.';
+  // The data server may be asleep or far away: wait at most 4 s, then open the notebooks anyway.
+  if (authClient.isAuthenticated()) await Promise.race([store.syncWithCloud(), new Promise(r => setTimeout(r, 4000))]);
   await seed();
   await route();
 })();
