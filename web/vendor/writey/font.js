@@ -12,6 +12,7 @@ const cache = new Map();
 // 'cursive' keeps Writey's EMS Allure. Maths operators and Greek always come from Allure.
 const PRINT_CHARS = /^[A-Za-z0-9.,:;!?'"()\[\]%&]$/;
 let style = 'print';
+const PRINT_SCALE = 0.86;
 export function setHandStyle(s) { if (s !== style) { style = s === 'cursive' ? 'cursive' : 'print'; cache.clear(); } }
 export const handStyle = () => style;
 const ALIASES = {
@@ -31,7 +32,9 @@ export function glyph(ch) {
     const key = ALIASES[ch] ?? ch;
     if (cache.has(key))
         return cache.get(key) ?? null;
-    const raw = (style === 'print' && PRINT_CHARS.test(key) && PRINT_GLYPHS[key]) || GLYPHS[key];
+    const print = style === 'print' && PRINT_CHARS.test(key) && PRINT_GLYPHS[key];
+    // print letters are drawn a little smaller so their tall x-height sits like Allure's on the line
+    const raw = print ? [print[0] * PRINT_SCALE, print[1].map(st => st.map(n => n * PRINT_SCALE))] : GLYPHS[key];
     let g = null;
     if (raw) {
         const strokes = raw[1].map((s) => s.map((n) => n / 1000));
