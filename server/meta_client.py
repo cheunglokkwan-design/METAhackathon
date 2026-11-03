@@ -281,6 +281,25 @@ Return ONLY JSON, no explanation: {"lines": [{"text": "∫ x cos(x) dx", "bbox":
 where bbox is the line's box in image pixels, origin top-left. If there is truly no math,
 return {"lines": []}."""
 
+TEXT_PROMPT = """Transcribe the handwriting in this image exactly, line by line, top to bottom: words as
+words, maths as plain text (x^2, sqrt(x), ∫ x dx, sin(30)). Fix nothing and add nothing.
+Return ONLY JSON: {"lines": ["first line", "second line"]}. If nothing is written, {"lines": []}."""
+
+
+def read_handwriting(image_dataurl: str) -> list[str]:
+    """Muse Spark vision: the handwriting in a cropped image as lines of text ([] offline or on failure)."""
+    url = (image_dataurl or "").strip()
+    if is_offline() or len(url) > MAX_IMAGE_CHARS or not _DATA_IMAGE_RE.match(url):
+        return []
+    reply = _chat([{"role": "system", "content": TEXT_PROMPT},
+                   {"role": "user", "content": [{"type": "image_url", "image_url": {"url": url}}]}],
+                  max_tokens=READ_MAX_TOKENS)
+    data = _extract_json(reply or "")
+    lines = data.get("lines") if isinstance(data, dict) else None
+    texts = [str(l.get("text", "") if isinstance(l, dict) else l)[:300].strip() for l in (lines or [])]
+    return [t for t in texts if t][:40]
+
+
 # Muse Spark is a reasoning model: thinking tokens count against max_tokens, so a small budget
 # can end with an empty answer (finish_reason "length"). Give page reading plenty of room.
 READ_MAX_TOKENS = int(os.getenv("READ_MAX_TOKENS", "8000"))

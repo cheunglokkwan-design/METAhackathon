@@ -1,9 +1,9 @@
 // Margin service worker: the app shell opens offline. /api/* always goes to the network.
 // pdf.js (vendor/pdfjs/) is not in the shell: it is cached the first time a PDF is imported.
-const VERSION = 'margin-v17';
+const VERSION = 'margin-v18';
 const SHELL = [
   './', 'index.html', 'styles.css', 'manifest.webmanifest',
-  'app.js', 'ink.js', 'assistant.js', 'voice.js', 'store.js', 'shelf.js', 'pages.js', 'zoom.js', 'export.js', 'ui.js', 'images.js', 'handwriting.js', 'suggest.js',
+  'app.js', 'ink.js', 'assistant.js', 'voice.js', 'store.js', 'shelf.js', 'pages.js', 'zoom.js', 'export.js', 'ui.js', 'images.js', 'handwriting.js', 'suggest.js', 'shapes.js',
   'vendor/writey/glyphs.js', 'vendor/writey/glyphs_print.js', 'vendor/writey/font.js', 'vendor/writey/latex.js', 'vendor/writey/layout.js', 'vendor/writey/text.js', 'vendor/writey/hand.js',
   'vendor/perfect-freehand.js', 'vendor/jspdf.umd.min.js',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/apple-touch-icon.png', 'icons/favicon-32.png',

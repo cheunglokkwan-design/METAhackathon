@@ -364,6 +364,18 @@ def assist(
     return resp
 
 
+class ReadRequest(BaseModel):
+    image: str = Field(max_length=meta_client.MAX_IMAGE_CHARS)
+
+
+@app.post("/api/read")
+def read_text(req: ReadRequest) -> dict[str, Any]:
+    """Lasso › To text: the selected handwriting as lines of typed text (Muse Spark vision)."""
+    if meta_client.is_offline():
+        raise HTTPException(status_code=503, detail="Meta is offline, so it can't read handwriting")
+    return {"lines": meta_client.read_handwriting(req.image)}
+
+
 @app.post("/api/transcribe")
 def transcribe(audio: UploadFile = File(...)) -> dict[str, Any]:
     # Plain def: the upstream call blocks, so FastAPI runs this in its threadpool.

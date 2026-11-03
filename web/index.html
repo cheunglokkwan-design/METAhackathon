@@ -126,6 +126,9 @@
           <div class="menu-row"><span>Meta writes in</span><div class="meta-inks" role="group" aria-label="Meta’s ink colour">
             <button data-meta-ink="#d0452b" style="--c:#d0452b" title="Pencil red" aria-label="Pencil red" aria-pressed="true"></button><button data-meta-ink="#5b6470" style="--c:#5b6470" title="Graphite" aria-label="Graphite" aria-pressed="false"></button><button data-meta-ink="#b0337a" style="--c:#b0337a" title="Magenta" aria-label="Magenta" aria-pressed="false"></button><button data-meta-ink="mine" class="mine" title="Write in my pen colour" aria-pressed="false">My colour</button>
           </div></div>
+          <div class="menu-row"><span>Tidy my writing</span><div class="seg mini" id="tidy-seg">
+            <button data-tidy="on" aria-pressed="true" title="Smooth strokes; hold still at the end of a stroke to snap a line, circle or box">On</button><button data-tidy="off" aria-pressed="false">Off</button>
+          </div></div>
           <div class="menu-row"><span>Meta’s writing</span><div class="seg mini" id="hand-seg">
             <button data-hand="print" aria-pressed="true">Print</button><button data-hand="cursive" aria-pressed="false">Cursive</button>
           </div></div>
@@ -173,6 +176,7 @@
               <button data-recolor="#ffd426" style="--c:#ffd426" title="Yellow highlight" aria-label="Yellow highlight"></button><button data-recolor="#7fe07a" style="--c:#7fe07a" title="Green highlight" aria-label="Green highlight"></button><button data-recolor="#ff86c3" style="--c:#ff86c3" title="Pink highlight" aria-label="Pink highlight"></button>
             </div>
             <button data-sel="more" class="sel-act" title="Ask Meta for a more specific hint" hidden>More help</button>
+            <button data-sel="convert" class="sel-act" title="Turn the handwriting into typed text (Meta reads it)">To text</button>
             <button data-sel="adopt" class="sel-act sel-adopt" title="Make Meta’s ink yours: your colour, and Meta reads it as your work">Make it mine</button>
             <button data-sel="delete" class="sel-del" title="Delete (⌫)"><svg><use href="#i-trash"/></svg><span>Delete</span></button>
           </div>

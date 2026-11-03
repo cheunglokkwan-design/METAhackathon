@@ -24,6 +24,7 @@
 // make it theirs. Only an explicit "Keep as mine" (lasso bar) adopts them: by becomes 'student-adopted',
 // they take the student's pen colour and Meta reads them from then on. Older items have no `by` (student).
 import { getStroke } from './vendor/perfect-freehand.js';   // vendored, MIT (web/vendor/perfect-freehand.LICENSE)
+import { smoothStroke, recognizeShape } from './shapes.js';
 import { imageFor, loadItemImages } from './images.js';
 
 export const PAGE_W = 1000, PAGE_H = 1400, RULE = 44, TOP = 132, MARGIN_X = 96;
@@ -35,6 +36,7 @@ export const rowAt = y => Math.max(0, Math.ceil((y - TOP) / RULE));
 
 export const PEN_SIZES = { fine: 1.2, medium: 1.8, bold: 3 };
 export const HL_SIZE = 22, HL_ALPHA = 0.42;
+const HOLD_MS = 550;                                  // hold the pen still this long to snap a shape
 export const HL_COLORS = ['#ffd426', '#7fe07a', '#ff86c3'];
 
 const mctx = document.createElement('canvas').getContext('2d');
@@ -308,6 +310,7 @@ export class Notebook {
     this.lastPoint = { x: 320, y: 220 }; this.penSeen = false; this.active = null; this.cursor = null;
     this.sel = []; this.lasso = null; this.drag = null;
     this.metaHidden = false;                          // "Hide Meta's ink": by:'meta' items are not drawn or touched
+    this.tidy = { smooth: true, shapes: true };       // smooth finished strokes; hold still to snap a shape
     this.ctx = ink.getContext('2d'); this.lctx = live.getContext('2d');
     for (const t of ['pointerdown', 'pointermove', 'pointerup', 'pointercancel']) page.addEventListener(t, e => this[t](e));
     page.addEventListener('pointerleave', () => { if (!this.active) { this.cursor = null; this.renderLive(); } });
@@ -363,6 +366,7 @@ export class Notebook {
       this.cur = { type: 'stroke', color: hl ? this.hlColor : this.color, size: hl ? HL_SIZE : this.size, sim: e.pointerType !== 'pen', pts: [[pt.x, pt.y, pt.p]] };
       if (hl) this.cur.hl = true;
       this.cur.t0 = performance.now(); this.cur.ptype = e.pointerType;
+      if (!hl) this.holdAt(pt);
       // Long-press menu on Meta's ink: fingers and mouse only. A resting Pencil is about to write.
       const hit = !hl && e.pointerType !== 'pen' && this.onLongPress && this.metaAt(pt);
       if (hit) this.press = { x: pt.x, y: pt.y, t: setTimeout(() => this.longPress(hit), 520) };
@@ -382,7 +386,7 @@ export class Notebook {
     const evs = e.getCoalescedEvents?.() ?? [];
     for (const ev of evs.length ? evs : [e]) {
       const q = this.pos(ev);
-      if (this.cur) this.cur.pts.push([q.x, q.y, q.p]);
+      if (this.cur) { if (!this.cur.shaped) { this.cur.pts.push([q.x, q.y, q.p]); if (!this.cur.hl) this.holdAt(q); } }
       else if (this.lasso) this.lasso.push([q.x, q.y]);
       else this.eraseAt(q);
     }
@@ -394,12 +398,15 @@ export class Notebook {
     if (!a || e.pointerId !== a.id) return;
     this.active = null;
     this.cancelPress();
+    clearTimeout(this.hold?.t); this.hold = null;
     if (this.cur) {
       const s = this.cur; this.cur = null;
       const p0 = s.pts[0], tap = performance.now() - s.t0 < 300 && s.pts.every(([x, y]) => Math.hypot(x - p0[0], y - p0[1]) < 6 / Math.max(0.3, this.scale));
       const ptype = s.ptype; delete s.t0; delete s.ptype;
       if (this.beforeStroke?.(s, { tap, ptype })) { this.renderLive(); return; }
       if (!s.hl && this.scratchOut(s.pts)) { this.renderLive(); return; }
+      if (!s.hl && !s.shaped && this.tidy.smooth) s.pts = smoothStroke(s.pts);
+      delete s.shaped;
       if (s.pts.length === 1) s.pts.push([s.pts[0][0] + 0.4, s.pts[0][1] + 0.4, s.pts[0][2]]);
       this.prepare(s);
       this.checkpoint(); this.items.push(s);
@@ -414,6 +421,24 @@ export class Notebook {
     this.renderLive();
   }
   pointercancel(e) { this.pointerup(e); }
+
+  // Hold the pen still for a moment at the end of a stroke: a rough shape snaps to a clean one.
+  holdAt(q) {
+    if (!this.tidy.shapes) return;
+    const h = this.hold;
+    if (h && Math.hypot(q.x - h.x, q.y - h.y) < 3 / Math.max(0.3, this.scale)) return;   // still holding
+    clearTimeout(h?.t);
+    this.hold = { x: q.x, y: q.y, t: setTimeout(() => this.snapShape(), HOLD_MS) };
+  }
+  snapShape() {
+    const s = this.cur;
+    if (!s || s.hl || s.shaped) return;
+    const shape = recognizeShape(s.pts);
+    if (!shape) return;
+    s.pts = shape.pts; s.shaped = shape.kind;
+    this.renderLive();
+    this.onShape?.(shape.kind);
+  }
 
   // A second finger arrived: drop the half-drawn stroke, the gesture is a pinch.
   cancelActive() {
@@ -881,6 +906,18 @@ export class Notebook {
 
   // White page with the student's ink, typed text and pictures, cropped below the content.
   // Meta's own ink (by: 'meta') is left out. JPEG when there is a photo on it (much smaller), PNG otherwise.
+  // Just these items, cropped to them, on white (for Meta to read a lasso selection).
+  snapshotOf(items) {
+    const b = union(items.map(it => it.bbox)), pad = 16;
+    const c = document.createElement('canvas');
+    c.width = Math.ceil(b[2] + 2 * pad); c.height = Math.ceil(b[3] + 2 * pad);
+    const g = c.getContext('2d');
+    g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+    g.translate(pad - b[0], pad - b[1]);
+    paintItems(g, items);
+    return c.toDataURL('image/png');
+  }
+
   snapshot() {
     const items = this.items.filter(mine);
     const bottom = Math.min(PAGE_H, Math.max(TOP + RULE, ...items.map(it => it.bbox[1] + it.bbox[3])) + 40);

@@ -362,8 +362,32 @@ selBar.onclick = e => {
   if (b.dataset.recolor) nb.recolorSelection(b.dataset.recolor, b.closest('.hl') != null);
   if (b.dataset.sel === 'delete') nb.deleteSelection();
   if (b.dataset.sel === 'adopt' && nb.adoptSelection()) toast('It’s yours now: Meta will read it as your work.', { label: 'Undo', fn: () => nb.undo() });
+  if (b.dataset.sel === 'convert') convertSelection();
   if (b.dataset.sel === 'more') { nb.clearSelection(); callMeta('more please, be more specific', 'hint', { escalate: true }); }
 };
+// Lasso › To text: Meta reads the selected handwriting and it becomes a typed text box in its place.
+async function convertSelection() {
+  const strokes = nb.sel.filter(it => it.type === 'stroke' && !it.hl && !isMeta(it));
+  if (!strokes.length) { toast('Select some handwriting first.'); return; }
+  const image = nb.snapshotOf(strokes);
+  const box = nb.selBox();
+  toast('Meta is reading your writing…');
+  let lines = [];
+  try {
+    const r = await fetch('/api/read', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ image }) });
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || `HTTP ${r.status}`);
+    lines = j.lines || [];
+  } catch (err) { toast(`Couldn’t read it: ${err.message}`); return; }
+  if (!lines.length) { toast('Meta couldn’t read that writing.'); return; }
+  nb.checkpoint();
+  nb.items = nb.items.filter(it => !strokes.includes(it));
+  const color = strokes[0].color || nb.color;
+  const tb = nb.add({ type: 'textbox', x: box[0] + 6, y: box[1] + 6, w: Math.max(160, box[2]), text: lines.join('\n'), color });
+  nb.clearSelection(); nb.setSelection?.([tb]); nb.redraw(); scheduleSave();
+  toast('Turned into text.', { label: 'Undo', fn: () => nb.undo() });
+}
+
 function showSelBar(box) {
   const selBar = $('#sel-bar');                     // looked up here: zoom calls this while the app is starting
   if (!box) { selBar.hidden = true; return; }
@@ -498,6 +522,28 @@ function showMetaInk() {
   $$('[data-meta-ink]').forEach(b => b.setAttribute('aria-pressed', b.dataset.metaInk === metaInk));
   meta.syncColor();
 }
+// Tidy my writing: smooth finished strokes, and hold the pen still to snap a rough shape (like Apple Notes).
+let tidyOn = true;
+try { tidyOn = localStorage.getItem('margin.tidy') !== 'off'; } catch { /* private mode */ }
+const SHAPE_NAMES = { line: 'a straight line', polyline: 'straight lines', circle: 'a circle', ellipse: 'an oval', rectangle: 'a rectangle', triangle: 'a triangle', quadrilateral: 'a four-sided shape' };
+const applyTidy = () => { nb.tidy.smooth = nb.tidy.shapes = tidyOn; $$('[data-tidy]').forEach(b => b.setAttribute('aria-pressed', (b.dataset.tidy === 'on') === tidyOn)); };
+applyTidy();
+$$('[data-tidy]').forEach(b => b.onclick = () => {
+  tidyOn = b.dataset.tidy === 'on'; applyTidy();
+  try { localStorage.setItem('margin.tidy', tidyOn ? 'on' : 'off'); } catch { /* private mode */ }
+  toast(tidyOn ? 'Strokes are smoothed. Hold still at the end of a stroke to snap a shape.' : 'Your strokes stay exactly as drawn.');
+});
+let shapeTipShown = false;
+try { shapeTipShown = localStorage.getItem('margin.shapeTip') === '1'; } catch { /* private mode */ }
+nb.onShape = kind => {
+  const what = SHAPE_NAMES[kind] || 'a shape';
+  if (!shapeTipShown) {
+    shapeTipShown = true;
+    try { localStorage.setItem('margin.shapeTip', '1'); } catch { /* private mode */ }
+    toast(`Snapped to ${what}. Lift the pen to keep it, or undo after. Turn this off in ⋯ › Tidy my writing.`);
+  } else toast(`Snapped to ${what}.`);
+};
+
 // Meta's handwriting: upright print (default, easy to read) or Writey's cursive.
 let handPref = 'print';
 try { if (localStorage.getItem('margin.handStyle') === 'cursive') handPref = 'cursive'; } catch { /* private mode */ }
