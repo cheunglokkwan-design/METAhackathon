@@ -29,8 +29,8 @@ const clean = t => stripWake(t.replace(/\s+/g, ' ')).replace(/^[,.!?\s]+/, '');
 
 // Muse Voice Transcribe takes only 16-bit mono PCM WAV at 16 or 24 kHz, and browsers record
 // webm/opus (Chrome) or mp4/aac (Safari). Decode the recording and write it out as WAV.
-// Speech is also trimmed (the 10 s of silence before the mic turns off is dropped) and brought up to a
-// clear level, since a quiet laptop mic can come back from Meta as "no words".
+// The recording is sent exactly as the mic heard it: boosting or trimming quiet audio distorted it
+// and Meta misheard it (a whole sentence came back as "Sorry").
 export const QUIET_PEAK = 0.003;                     // below this the mic recorded silence
 
 // Is this speech? Quiet laptop mics and soft voices sit far below a fixed threshold, so the bar is
@@ -48,15 +48,6 @@ export class SpeechGate {
   }
 }
 
-// Automatic gain for live audio: brings a quiet voice up to a clear level (up to 25x) without
-// clipping a loud one. Follows the recent peak, falling back slowly after loud sounds.
-export class Leveler {
-  constructor() { this.peak = 0.02; }
-  gainFor(framePeak) {
-    this.peak = Math.max(framePeak, this.peak * 0.97, 0.004);
-    return Math.max(1, Math.min(25, 0.6 / this.peak));
-  }
-}
 export async function toWav(blob) {
   const AC = window.AudioContext || window.webkitAudioContext;
   const ctx = new AC();
@@ -73,13 +64,7 @@ export async function toWav(blob) {
       const v = sum / ((b - a) * chans.length);
       mono[i] = v; if (Math.abs(v) > peak) peak = Math.abs(v);
     }
-    // Trim to the loud part, keeping 0.4 s either side so first and last words aren't clipped.
-    const gate = Math.max(peak * 0.08, 0.003), pad = Math.round(WAV_RATE * 0.4);
-    let first = 0, last = n - 1;
-    while (first < n && Math.abs(mono[first]) < gate) first++;
-    while (last > first && Math.abs(mono[last]) < gate) last--;
-    const from = Math.max(0, first - pad), to = Math.min(n, last + pad + 1), len = Math.max(0, to - from);
-    const gain = peak > 0 ? Math.min(0.9 / peak, 60) : 1;   // up to 60x for a quiet mic
+    const from = 0, len = n;                           // sent as recorded: no trimming, no boost
     const out = new DataView(new ArrayBuffer(44 + len * 2));
     const str = (o, t) => [...t].forEach((ch, i) => out.setUint8(o + i, ch.charCodeAt(0)));
     str(0, 'RIFF'); out.setUint32(4, 36 + len * 2, true); str(8, 'WAVE'); str(12, 'fmt ');
@@ -87,7 +72,7 @@ export async function toWav(blob) {
     out.setUint32(24, WAV_RATE, true); out.setUint32(28, WAV_RATE * 2, true); out.setUint16(32, 2, true); out.setUint16(34, 16, true);
     str(36, 'data'); out.setUint32(40, len * 2, true);
     for (let i = 0; i < len; i++) {
-      const v = Math.max(-1, Math.min(1, mono[from + i] * gain));
+      const v = Math.max(-1, Math.min(1, mono[from + i]));
       out.setInt16(44 + i * 2, v < 0 ? v * 0x8000 : v * 0x7fff, true);
     }
     const wav = new Blob([out.buffer], { type: 'audio/wav' });
@@ -251,6 +236,7 @@ export class Voice {
         this.log(`Meta replied${body.audio_ms != null ? ` (heard ${(body.audio_ms / 1000).toFixed(1)} s)` : ''}`);
         const text = clean(this.prefix + (body.text || ''));
         if (text) this.h.onText?.(text);
+        else if (body.unclear) throw new Error(`Meta only caught “${body.unclear}” from ${wav.seconds.toFixed(1)} s of audio, so it probably misheard. Try again a little closer to the mic` + (SR ? ', or use Browser speech in the bar.' : '.'));
         else throw new Error(`Meta got ${wav.seconds.toFixed(1)} s of audio (level ${level}%) but found no words${body.session ? ` (session ${body.session})` : ''}. ` + (SR ? 'Try Browser speech in the bar instead.' : 'Try again, speaking a little louder.'));
       } catch (err) {
         this.fail(err.message || String(err));
@@ -286,7 +272,7 @@ export class Voice {
         src = ctx.createMediaStreamSource(stream);
         proc = ctx.createScriptProcessor(2048, 1, 1);
         const step = ctx.sampleRate / LIVE_RATE;
-        const gate = new SpeechGate(), level = new Leveler();
+        const gate = new SpeechGate();   // only decides when the speaker has gone quiet
         let pos = 0;
         proc.onaudioprocess = e => {
           const inp = e.inputBuffer.getChannelData(0);
@@ -303,9 +289,8 @@ export class Voice {
           }
           pos = pos + n * step - inp.length;
           if (gate.hear(Math.sqrt(sq / n))) this.lastSpeech = Date.now();
-          // a soft voice is turned up before Meta hears it, so nobody has to shout
-          const g = level.gainFor(peak), out = new Int16Array(n);
-          for (let i = 0; i < n; i++) { const v = Math.max(-1, Math.min(1, mono[i] * g)); out[i] = v < 0 ? v * 0x8000 : v * 0x7fff; }
+          const out = new Int16Array(n);                // raw audio, as the mic heard it
+          for (let i = 0; i < n; i++) { const v = Math.max(-1, Math.min(1, mono[i])); out[i] = v < 0 ? v * 0x8000 : v * 0x7fff; }
           ws.send(out.buffer);
         };
         src.connect(proc); proc.connect(ctx.destination);   // Chrome only runs a connected processor

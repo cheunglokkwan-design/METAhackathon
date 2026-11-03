@@ -818,8 +818,25 @@ def transcribe(audio_bytes: bytes, filename: str = "command.wav") -> str:
 
 
 def _asr_text(body: dict[str, Any]) -> str:
-    text = body.get("transcript") or " ".join(t.get("transcript", "") for t in body.get("turns") or [])
-    return (text or "").strip()
+    """The transcript: the longer of the top-level text and the turns joined (one can hold only a part)."""
+    top = str(body.get("transcript") or "").strip()
+    turns = " ".join(str(t.get("transcript") or "").strip() for t in body.get("turns") or [] if isinstance(t, dict)).strip()
+    return top if len(top) >= len(turns) else turns
+
+
+# What speech recognisers say when they hear only noise or mumbling: "Sorry", "Thank you", "you".
+_FILLER = {"sorry", "thank you", "thanks", "thank you very much", "you", "bye", "okay", "ok", "hmm", "uh", "um",
+           "oh", "yeah", "yes", "no", "hello", "hi"}
+
+
+def asr_unclear(text: str, audio_ms: Any) -> bool:
+    """True for a lone filler word from several seconds of audio: a mishearing, not a command."""
+    t = re.sub(r"[^a-z ]", "", (text or "").lower()).strip()
+    try:
+        long_audio = float(audio_ms or 0) > 2000
+    except (TypeError, ValueError):
+        long_audio = False
+    return bool(t) and t in _FILLER and long_audio
 
 
 def transcribe_full(audio_bytes: bytes, filename: str = "command.wav") -> dict[str, Any]:
@@ -850,11 +867,15 @@ def transcribe_full(audio_bytes: bytes, filename: str = "command.wav") -> dict[s
         raise OfflineError("rate limit exceeded")
     try:
         body = _asr_post(audio_bytes)
-        if not _asr_text(body):
-            # Push-to-talk heard nothing: ask once more with Meta's own speech detection.
-            log.warning("Meta transcription empty (session %s, %s ms); retrying in ENDPOINTING mode",
-                        body.get("sessionId"), body.get("audioDurationMs"))
-            body = _asr_post(audio_bytes, "ENDPOINTING")
+        first = _asr_text(body)
+        log.info("Meta transcription: %r (%s ms, %d turns)", first[:120], body.get("audioDurationMs"), len(body.get("turns") or []))
+        if not first or asr_unclear(first, body.get("audioDurationMs")):
+            # Heard nothing, or only "Sorry" from seconds of audio: ask once more with Meta's own speech detection.
+            log.warning("Meta transcription %r (session %s, %s ms); retrying in ENDPOINTING mode",
+                        first, body.get("sessionId"), body.get("audioDurationMs"))
+            again = _asr_post(audio_bytes, "ENDPOINTING")
+            if len(_asr_text(again)) > len(first) or not first:
+                body = again
         circuit_breaker.record_success()
     except TranscribeError:
         circuit_breaker.record_success()               # Meta answered; the audio was the problem
@@ -866,4 +887,7 @@ def transcribe_full(audio_bytes: bytes, filename: str = "command.wav") -> dict[s
     text = _asr_text(body)
     if not text:
         log.warning("Meta transcription empty again (session %s, %s ms)", body.get("sessionId"), body.get("audioDurationMs"))
-    return {"text": text, "session": body.get("sessionId"), "audio_ms": body.get("audioDurationMs")}
+    out = {"text": text, "session": body.get("sessionId"), "audio_ms": body.get("audioDurationMs")}
+    if asr_unclear(text, body.get("audioDurationMs")):
+        out = {**out, "text": "", "unclear": text}          # don't run "Sorry" as a command
+    return out
