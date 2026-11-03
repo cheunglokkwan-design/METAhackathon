@@ -87,6 +87,9 @@ const API_BASE = (() => {
     return /^https?:\/\/[^/]+/.test(u) ? u : '';
   } catch { return ''; }
 })();
+// Sign-in is switched off (2026-11-03): notebooks save on this device only, nothing goes to the
+// data server. Flip to true to bring account sync back.
+const CLOUD_SYNC = false;
 const DATA_PATH = /^\/api\/(auth|notebooks)(\/|\?|$)/;
 const OFFLINE_MSG = "Can't reach the Margin server right now. Your notebooks still save on this device.";
 
@@ -226,7 +229,7 @@ export const authClient = {
 };
 
 async function syncNotebookToCloud(nb) {
-  if (!authClient.isAuthenticated() || !nb?.id) return;
+  if (!(CLOUD_SYNC && authClient.isAuthenticated()) || !nb?.id) return;
   try {
     const r = await authClient.fetchWithAuth(`/api/notebooks/${encodeURIComponent(nb.id)}`, {
       method: 'PATCH',
@@ -248,7 +251,7 @@ async function syncNotebookToCloud(nb) {
 }
 
 async function syncPageToCloud(page) {
-  if (!authClient.isAuthenticated() || !page?.id || !page?.notebookId) return;
+  if (!(CLOUD_SYNC && authClient.isAuthenticated()) || !page?.id || !page?.notebookId) return;
   try {
     await authClient.fetchWithAuth(
       `/api/notebooks/${encodeURIComponent(page.notebookId)}/pages/${encodeURIComponent(page.id)}`,
@@ -275,7 +278,7 @@ export const store = {
     const nb = await get('notebooks', id);
     for (const pid of nb?.pages ?? []) await this.deletePage(pid);
     await del('notebooks', id);
-    if (authClient.isAuthenticated()) {
+    if ((CLOUD_SYNC && authClient.isAuthenticated())) {
       authClient.fetchWithAuth(`/api/notebooks/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
     }
   },
@@ -290,7 +293,7 @@ export const store = {
     const p = await get('pages', id);
     for (const it of p?.items ?? []) if (it.type === 'image' && it.blob) await del('blobs', it.blob);
     await del('pages', id);
-    if (authClient.isAuthenticated() && p?.notebookId) {
+    if ((CLOUD_SYNC && authClient.isAuthenticated()) && p?.notebookId) {
       authClient.fetchWithAuth(`/api/notebooks/${encodeURIComponent(p.notebookId)}/pages/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {});
     }
   },
@@ -303,7 +306,7 @@ export const store = {
 
   // Pull cloud notebooks & pages into IndexedDB and push local unsynced notebooks to PostgreSQL
   async syncWithCloud() {
-    if (!authClient.isAuthenticated()) return false;
+    if (!(CLOUD_SYNC && authClient.isAuthenticated())) return false;
     try {
       const localBooks = await this.listNotebooks();
       for (const lb of localBooks) {
