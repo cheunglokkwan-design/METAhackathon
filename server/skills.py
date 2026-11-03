@@ -12,6 +12,7 @@ Every `write`, `ghost` and `typeset` annotation carries `latex` (SymPy's reading
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable
 
 import sympy as sp
@@ -22,13 +23,13 @@ from . import checker, explain, meta_client, render
 TOOL_MODE = {
     "check_steps": "check", "give_hint": "hint", "finish_answer": "answer",
     "typeset_lines": "typeset", "sketch_graph": "graph", "differentiate_check": "check",
-    "next_step": "next", "explain_rule": "why",
+    "next_step": "next", "explain_rule": "why", "sketch_3d": "graph", "draw_picture": "picture",
 }
 # Offline / explicit intent -> tool.
 INTENT_TOOL = {
     "hint": "give_hint", "answer": "finish_answer", "check": "check_steps",
     "typeset": "typeset_lines", "graph": "sketch_graph", "verify": "differentiate_check",
-    "next": "next_step", "why": "explain_rule",
+    "next": "next_step", "why": "explain_rule", "picture": "draw_picture",
 }
 
 # OpenAI-style tool definitions sent to Muse Spark (chat completions `tools`).
@@ -76,6 +77,22 @@ TOOL_SPECS: list[dict[str, Any]] = [
             "show_answer": {"type": "boolean",
                             "description": "Also draw the antiderivative/derivative even if the student "
                                            "has not finished. Only if they asked for the answer."}}}}},
+    {"type": "function", "function": {
+        "name": "sketch_3d",
+        "description": "Sketch a 3D surface z = f(x, y) as a wireframe on the page. Use when the student "
+                       "asks for a 3D graph or surface, or the function has two variables (x and y).",
+        "parameters": {"type": "object", "properties": {
+            "expression": {"type": "string",
+                           "description": "f(x, y) to draw, e.g. 'x^2 - y^2'. Leave out to use the page."}}}}},
+    {"type": "function", "function": {
+        "name": "draw_picture",
+        "description": "Draw a picture or diagram on the page with Muse Image (a pencil sketch, no text). "
+                       "Use when the student asks for a picture, image or diagram of a situation, e.g. a "
+                       "related-rates ladder or a solid of revolution. Not for graphs of functions.",
+        "parameters": {"type": "object", "properties": {
+            "description": {"type": "string",
+                            "description": "What to draw, in a short phrase, e.g. 'a cone filling with water'."}},
+            "required": ["description"]}}},
     {"type": "function", "function": {
         "name": "differentiate_check",
         "description": "Verify by differentiating: d/dx of the student's antiderivative is compared "
@@ -132,6 +149,8 @@ def annotate(result: checker.CheckResult, mode: str, level: int) -> list[dict[st
         steps = checker.solve_remaining(result)
         for step in steps:
             ann.append({"kind": "write", "after": last.id, "text": step})
+        if steps and not wrong:
+            ann.extend(_degree_note(result, last))
         if not steps and not wrong:
             text = last.note or ("That's the answer!" if result.finished else "Nothing left to solve")
             ann.append(_note(last.id, text))
@@ -143,6 +162,8 @@ def _all_correct_notes(result: checker.CheckResult, mode: str, level: int,
     """Notes when no step is wrong: + C reminder, praise, or a nudge to the next step."""
     if last.note:
         return [_note(last.id, last.note)]
+    if last.parsed.asks_value and last.status in ("ok", "start") and result.base_value is not None:
+        return _value_notes(result, mode, level, last)
     if not any(r.status in ("ok", "start") for r in result.lines):
         return [_note(last.id, "I can't read this line yet")]
     nudges = checker.next_step_hints(result) if mode == "hint" else None
@@ -154,6 +175,30 @@ def _all_correct_notes(result: checker.CheckResult, mode: str, level: int,
     if level >= 3 and nudges[3].startswith("Next: "):
         ann.append({"kind": "ghost", "after": last.id, "text": nudges[3][len("Next: "):]})
     return ann
+
+
+def _value_notes(result: checker.CheckResult, mode: str, level: int,
+                 last: checker.LineResult) -> list[dict[str, Any]]:
+    """The line ends in a bare '=' ("30 sin 30 ="): help the student work out its value."""
+    ev = checker.evaluate_value(result.base_value, True)
+    if ev is None:
+        return [_note(last.id, "I can't work this one out")]
+    value, why = ev
+    if mode != "hint":
+        return [_note(last.id, "Readable: now work out what it equals")]
+    if level == 1:
+        return [_note(last.id, f"{why}: work out each trig value first" if why else "Simplify it to one value")]
+    if level == 2:
+        trig = checker.trig_values(result.base_value)
+        return [_note(last.id, "; ".join(trig[:2]) if trig else "Combine the terms into one value")]
+    return [_note(last.id, why or "Here's the value"), {"kind": "ghost", "after": last.id, "text": value}]
+
+
+def _degree_note(result: checker.CheckResult, last: checker.LineResult) -> list[dict[str, Any]]:
+    if not last.parsed.asks_value or result.base_value is None:
+        return []
+    ev = checker.evaluate_value(result.base_value, True)
+    return [_note(last.id, ev[1])] if ev and ev[1] else []
 
 
 # --------------------------------------------------------------------------- toolbox
@@ -175,6 +220,7 @@ class Toolbox:
             "finish_answer": self.finish_answer, "typeset_lines": self.typeset_lines,
             "sketch_graph": self.sketch_graph, "differentiate_check": self.differentiate_check,
             "next_step": self.next_step, "explain_rule": self.explain_rule,
+            "sketch_3d": self.sketch_3d, "draw_picture": self.draw_picture,
         }
 
     # ------------------------------------------------------------------ running
@@ -198,11 +244,11 @@ class Toolbox:
         return {"summary": summary, "annotations_added": added, "first_wrong": self.result.first_wrong,
                 "finished": self.result.finished}
 
-    def route(self, intent: str, why: str) -> dict[str, Any]:
+    def route(self, intent: str, why: str, command: str = "") -> dict[str, Any]:
         """Offline or explicit-mode path: one tool picked by intent."""
         tool = INTENT_TOOL.get(intent, "give_hint")
         self.trace.append({"tool": "route", "summary": why[:90]})
-        self.run(tool, {})
+        self.run(tool, {"description": picture_subject(command)} if tool == "draw_picture" else {})
         return self.output()
 
     def output(self) -> dict[str, Any]:
@@ -268,7 +314,7 @@ class Toolbox:
             text = nudges[1] if nudges else "Try the next step yourself"
             return [_note(after.id, text)], "next: step failed the referee; nudge", "next"
         return ([{"kind": "write", "after": after.id, "text": step,
-                  "latex": checker.latex_for_text(step)}], f"next step: {step}", "next")
+                  "latex": checker.latex_for_text(step)}] + _degree_note(r, after), f"next step: {step}", "next")
 
     def _step_checks(self, step: str) -> bool:
         """The referee accepts `step` written under the page's lines."""
@@ -301,10 +347,32 @@ class Toolbox:
         g = render.graph_for(self.result, reveal=bool(show_answer))
         last = self.result.lines[-1].id if self.result.lines else None
         if g is None:
+            if render.surface_expr(self.result) is not None:      # two variables: a 3D surface instead
+                return self.sketch_3d()
             return [_note(last, "I can't graph this one")], "nothing to graph"
         g = {"kind": "graph", "after": last, **{k: v for k, v in g.items() if k != "kind"}}
         extra = f" with {g['overlay_fn']}" if "overlay_fn" in g else ""
         return [g], f"graphed {g['fn']}{extra}"
+
+    def sketch_3d(self, expression: str | None = None) -> tuple[list[dict[str, Any]], str]:
+        last = self.result.lines[-1].id if self.result.lines else None
+        expr = render.surface_expr(self.result, expression)
+        g = render.graph3d_for(expr) if expr is not None else None
+        if g is None:
+            return [_note(last, "I need a function of x and y for 3D")], "nothing to draw in 3D"
+        return [{**g, "after": last}], f"3D surface {g['fn']}"
+
+    def draw_picture(self, description: str = "") -> tuple[list[dict[str, Any]], str]:
+        last = self.result.lines[-1].id if self.result.lines else None
+        description = " ".join(str(description or "").split())[:300]
+        if not description:
+            return [_note(last, "Tell me what to draw")], "no description"
+        if meta_client.is_offline():
+            return [_note(last, "Pictures need Meta online")], "offline: no picture"
+        url = meta_client.generate_picture(description)
+        if url is None:
+            return [_note(last, "I couldn't draw that one")], "picture failed"
+        return [{"kind": "picture", "after": last, "image": url, "caption": description[:80]}], f"drew: {description[:60]}"
 
     def differentiate_check(self, line_id: str | None = None) -> tuple[list[dict[str, Any]], str]:
         r = self.result
@@ -331,6 +399,18 @@ class Toolbox:
         return ([{"kind": "circle", "target": target.id},
                   _note(target.id, f"d/dx gives {checker.pretty(dF)}, not {checker.pretty(f)}")],
                  f"d/dx({target.id}) != integrand")
+
+
+_PICTURE_ASK = re.compile(r"^(?:hey|hi|ok)?\W*(?:meta)?\W*(?:can you |could you |please )*"
+                          r"(?:draw|make|show|sketch|give)?\s*(?:me\s+)?(?:a |an |the )?"
+                          r"(?:picture|image|diagram|illustration|drawing)?\s*(?:of|showing|for)?\s*", re.I)
+
+
+def picture_subject(command: str) -> str:
+    """"Hey Meta, draw me a picture of a ladder on a wall" -> "a ladder on a wall"."""
+    c = " ".join(str(command or "").split())
+    rest = _PICTURE_ASK.sub("", c, count=1).strip(" .?!")
+    return rest or c
 
 
 def _clean_args(fn: Callable, args: dict[str, Any]) -> dict[str, Any]:

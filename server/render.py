@@ -250,3 +250,66 @@ def graph_for(result: CheckResult, reveal: bool = False) -> dict[str, Any] | Non
     if shade:
         out["shade"] = shade
     return out
+
+
+# --------------------------------------------------------------------------- 3D surfaces
+
+GRID3D = 19                                   # samples per side: a 19 x 19 wireframe
+
+
+def surface_expr(result: CheckResult, text: str | None = None) -> sp.Expr | None:
+    """The z = f(x, y) to draw: from `text` when given ("x^2 + y^2", "z = sin(x)cos(y)"), else the
+    page's lowest line with an expression in two variables."""
+    def pick(p: ParsedLine) -> sp.Expr | None:
+        for part in reversed(p.parts):
+            if part is not None and len(part.free_symbols) == 2 and not part.has(sp.Integral, sp.Derivative):
+                return part
+        return None
+    if text:
+        p = checker.parse_line(str(text)[:200])
+        return pick(p) if p.ok or any(x is not None for x in p.parts) else None
+    for line in reversed(result.lines):
+        e = pick(line.parsed)
+        if e is not None:
+            return e
+    return None
+
+
+def graph3d_for(expr: sp.Expr) -> dict[str, Any] | None:
+    """A z = f(x, y) surface sampled on a square grid, for the page to draw as a wireframe."""
+    syms = sorted(expr.free_symbols, key=lambda s: (s.name not in ("x", "y"), s.name))
+    if len(syms) != 2:
+        return None
+    u, v = syms
+    span = 3.2 if expr.has(sp.sin, sp.cos, sp.tan) else 2.0
+    try:
+        f = sp.lambdify((u, v), expr, modules=[{"log": _log, "sqrt": _sqrt}, "math"])
+    except Exception:
+        return None
+    axis = [round(-span + 2 * span * i / (GRID3D - 1), 3) for i in range(GRID3D)]
+    z: list[list[float | None]] = []
+    vals: list[float] = []
+    for yv in axis:
+        row: list[float | None] = []
+        for xv in axis:
+            try:
+                w = complex(f(xv, yv))
+                ok = abs(w.imag) < 1e-9 and math.isfinite(w.real)
+            except Exception:
+                ok = False
+            row.append(round(w.real, 4) if ok else None)
+            if ok:
+                vals.append(w.real)
+        z.append(row)
+    if len(vals) < GRID3D * GRID3D // 3:
+        return None
+    vals.sort()
+    q = lambda t: vals[int(t * (len(vals) - 1))]
+    lo, hi = vals[0], vals[-1]
+    if hi - lo > 6 * (q(0.9) - q(0.1)):                 # spikes (1/(x^2+y^2)): clip to the bulk
+        lo, hi = q(0.03), q(0.97)
+    if hi - lo < 1e-9:
+        lo, hi = lo - 1, hi + 1
+    z = [[None if c is None else round(min(max(c, lo), hi), 4) for c in row] for row in z]
+    return {"kind": "graph3d", "fn": f"z = {pretty(expr)}", "vars": [u.name, v.name],
+            "xs": axis, "ys": axis, "z": z, "zrange": [round(lo, 4), round(hi, 4)]}

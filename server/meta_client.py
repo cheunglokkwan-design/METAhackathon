@@ -25,7 +25,9 @@ log = logging.getLogger("margin.meta")
 BASE_URL = os.getenv("MODEL_BASE_URL", "https://api.meta.ai/v1")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "muse-spark-1.3")
 VOICE_MODEL = os.getenv("VOICE_MODEL", "muse-voice-transcribe-1.0")
-INTENTS = ("hint", "answer", "check", "typeset", "graph", "verify", "next", "why")
+IMAGE_MODEL = os.getenv("IMAGE_MODEL", "muse-image-1.0")
+MAX_PICTURE_B64 = 3_000_000          # keeps the reply under Vercel's 4.5 MB response limit
+INTENTS = ("hint", "answer", "check", "typeset", "graph", "verify", "next", "why", "picture")
 AGENT_MAX_ITERS = 4
 MAX_IMAGE_CHARS = 5_000_000
 MAX_AUDIO_BYTES = 10 * 1024 * 1024
@@ -200,6 +202,60 @@ def _chat(messages: list[dict[str, Any]], max_tokens: int = 1500) -> str | None:
         return None
 
 
+PICTURE_STYLE = ("A clean hand-drawn pencil sketch on plain white paper, like a diagram in a maths or physics "
+                 "textbook: simple dark grey lines, light hatching, no colour, no text or labels. Subject: ")
+
+
+def _image_mime(data: bytes) -> str | None:
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    return None
+
+
+def generate_picture(description: str) -> str | None:
+    """A pencil-sketch picture from Muse Image as a data: URL, or None (offline, refused, too big)."""
+    import base64
+
+    import httpx
+
+    if is_offline() or not description.strip():
+        return None
+    if not circuit_breaker.allow_request():
+        return None
+    if not rate_limiter.allow():
+        circuit_breaker.cancel_probe()
+        return None
+    try:
+        resp = httpx.post(
+            base_url().rstrip("/") + "/images/generations",
+            headers={"Authorization": f"Bearer {api_key()}", "Accept": "application/json"},
+            json={"model": IMAGE_MODEL, "prompt": PICTURE_STYLE + description.strip()[:300], "n": 1,
+                  "size": "1024x1024"},
+            timeout=60.0,
+        )
+        if resp.status_code != 200:
+            circuit_breaker.record_success()            # Meta answered; it refused this prompt
+            log.warning("Muse Image HTTP %s: %s", resp.status_code, resp.text[:160])
+            return None
+        b64 = (resp.json().get("data") or [{}])[0].get("b64_json") or ""
+        circuit_breaker.record_success()
+    except Exception as exc:
+        circuit_breaker.record_failure()
+        log.warning("Muse Image failed: %s", type(exc).__name__)
+        return None
+    if not b64 or len(b64) > MAX_PICTURE_B64:
+        return None
+    try:
+        mime = _image_mime(base64.b64decode(b64[:64] + "=" * (-len(b64[:64]) % 4)))
+    except ValueError:
+        mime = None
+    return f"data:{mime};base64,{b64}" if mime else None
+
+
 def _extract_json(text: str) -> Any:
     """Parse JSON from a reply that may be wrapped in ``` fences or prose."""
     fenced = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
@@ -336,6 +392,8 @@ def keyword_intent(command: str) -> str:
     c = (command or "").lower().replace("’", "'")
     if any(k in c for k in ("tidy", "typeset", "neat", "type it up", "clean up", "write it out properly")):
         return "typeset"
+    if any(k in c for k in ("picture", "image", "diagram", "illustrat", "drawing of")):
+        return "picture"
     if any(k in c for k in ("graph", "plot", "sketch", "draw the curve", "draw it")):
         return "graph"
     if "check" in c and any(k in c for k in ("differentiat", "derivative")):
@@ -381,6 +439,9 @@ Pick the tool(s) that match the request, usually exactly one:
 - tidy / typeset / neat -> typeset_lines
 - graph / plot / sketch -> sketch_graph
 - check by differentiating -> differentiate_check
+- 3D graph / surface / z = f(x, y) / two variables -> sketch_3d (pass the expression if it is not on the page)
+- picture / diagram / image / "draw a ..." something that is not a graph -> draw_picture with a short
+  description of the scene (e.g. "a ladder leaning on a wall", "a cone being filled with water")
 You may combine two (e.g. "check it and graph it"). Never call finish_answer unless the student
 asked for the answer. When you are done, reply with the single word DONE."""
 
@@ -483,7 +544,7 @@ def _route_from_text(box: Any, text: str, command: str) -> None:
         box.run(named[0], {})
         return
     intent = keyword_intent(command)
-    box.route(intent, f"model replied in text; keywords -> {intent}")
+    box.route(intent, f"model replied in text; keywords -> {intent}", command)
 
 
 # --------------------------------------------------------------------------- hints

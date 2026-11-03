@@ -3,6 +3,7 @@
 // animated stroke by stroke; the Caveat font is only a fallback if the engine throws.
 import { PAGE_W, PAGE_H, RULE, MARGIN_X, rowY, rowAt, baselineOf, overlap, inBox, isMeta, setMarkPainter, prepareItem } from './ink.js';
 import { authClient } from './store.js';
+import { saveImage } from './images.js';
 import { mathBox, textBox, lineBox, paragraph, toLatex, isMath, pathD, penTimes, penWidth, emFor, newSeed } from './handwriting.js';
 import { splitRows } from './vendor/writey/latex.js';
 
@@ -567,7 +568,7 @@ export class MetaInk {
   async render(resp, sentLines, ask = null, { spare = false } = {}) {
     // Typeset and graph ink stack with hints; each kind of answer replaces only its own kind.
     // The first-run tip stays until the student erases it.
-    const EXTRAS = new Set(['typeset', 'graph', 'tip']);
+    const EXTRAS = new Set(['typeset', 'graph', 'graph3d', 'picture', 'tip']);
     const kinds = new Set((resp.annotations || []).map(a => a.kind));
     const extrasOnly = kinds.size > 0 && [...kinds].every(k => EXTRAS.has(k));
     const keep = spare ? this.pid : null;
@@ -592,7 +593,7 @@ export class MetaInk {
     const ticked = new Set(anns.filter(a => a.kind === 'tick').map(a => a.target));
     // A tidy-up or a graph is not a marking: ticking only the right lines would hide the wrong one.
     if (!extrasOnly) for (const l of resp.lines || []) if (l.status === 'ok' && !ticked.has(l.id)) anns.push({ kind: 'tick', target: l.id });
-    const order = { tick: 0, circle: 1, underline: 2, note: 3, ghost: 4, write: 5, typeset: 6, graph: 7 };
+    const order = { tick: 0, circle: 1, underline: 2, note: 3, ghost: 4, write: 5, typeset: 6, graph: 7, graph3d: 8, picture: 9 };
     const todo = anns.filter(a => a.kind in order).sort((a, b) => order[a.kind] - order[b.kind]);
     if (!todo.length && resp.verdict) todo.push({ kind: 'note', target: null, text: resp.verdict });
     const pid = this.pid;
@@ -961,6 +962,66 @@ export class MetaInk {
         await this.legend(m, ol, cut(ol, 30), tx, gy + 36, gx + W - 4 - tx, token);
       }
     }
+  }
+  // ---- 3D surface z = f(x, y): a hand-sketched wireframe in an oblique view, as erasable ink ----
+  async a_graph3d(a, token) {
+    const xs = a.xs || [], ys = a.ys || [], Z = a.z || [];
+    const [z0, z1] = a.zrange?.length === 2 ? a.zrange : [0, 1];
+    if (xs.length < 2 || ys.length < 2 || Z.length !== ys.length || !(z1 > z0)) return;
+    const W = 300, H = 270;
+    const anchor = this.box(a.after) || this.lastBox();
+    const [gx, gy] = this.graphSpot(anchor, W, H);
+    const m = this.mark('graph3d');
+    m.boxes.push([gx, gy, W, H]);
+    this.onReveal?.([gx, gy, W, H]);
+    // u, v, w in [-1, 1]; screen: u to the right and down, v to the left and down, w up
+    const A = 62, B = 26, HZ = 58, cx = gx + W / 2, cy = gy + 40 + 2 * B + HZ;
+    const nu = x => -1 + 2 * (x - xs[0]) / (xs.at(-1) - xs[0]), nv = y => -1 + 2 * (y - ys[0]) / (ys.at(-1) - ys[0]);
+    const nw = z => -1 + 2 * (z - z0) / (z1 - z0);
+    const P = (u, v, w) => [cx + (u - v) * A, cy + (u + v) * B - w * HZ];
+    // axes from the back corner: x, y along the floor, z up
+    const axes = [[[-1, -1, -1], [1.25, -1, -1], 'x'], [[-1, -1, -1], [-1, 1.25, -1], 'y'], [[-1, -1, -1], [-1, -1, 1.3], 'z']];
+    for (const [p0, p1, t] of axes) {
+      if (token !== this.run) return;
+      const pa = P(...p0), pb = P(...p1), seg = [pa, pb];
+      await this.stroke(m, seg, smoothPath(seg), 160, token, 1.3, { opacity: 0.5 });
+      const lb = this.box_(() => textBox(t));
+      const [lx, ly] = t === 'z' ? [pb[0] - 6, pb[1] - 4] : t === 'x' ? [pb[0] + 3, pb[1] + 14] : [pb[0] - 16, pb[1] + 14];
+      if (lb) await this.hand(m, lb, lx, ly, 18, token, { label: t, attrs: { opacity: 0.65 }, maxMs: 90, reveal: false, width: 1.3 });
+    }
+    // grid lines: rows (constant y) then columns (constant x), each broken where the surface is undefined
+    const lines = [];
+    const run = cells => { let cur = []; for (const c of cells) { if (c) cur.push(c); else { if (cur.length > 1) lines.push(cur); cur = []; } } if (cur.length > 1) lines.push(cur); };
+    const step = Math.max(1, Math.round(xs.length / 12));
+    for (let j = 0; j < ys.length; j += step) run(xs.map((x, i) => Z[j][i] == null ? null : P(nu(x), nv(ys[j]), nw(Z[j][i]))));
+    for (let i = 0; i < xs.length; i += step) run(ys.map((y, j) => Z[j][i] == null ? null : P(nu(xs[i]), nv(y), nw(Z[j][i]))));
+    const ms = Math.max(25, Math.min(80, 1800 / (lines.length || 1)));
+    for (const s of lines) {
+      if (token !== this.run) return;
+      await this.stroke(m, s, smoothPath(s), ms, token, 1.4, { opacity: 0.85 });
+    }
+    if (a.fn) await this.legend(m, a.fn, a.fn.length > 34 ? a.fn.slice(0, 33) + '…' : a.fn, gx + 4, gy + 18, W - 8, token);
+  }
+
+  // ---- picture from Muse Image: a pencil sketch placed beside the work as a notebook picture ----
+  async a_picture(a, token) {
+    if (typeof a.image !== 'string' || !/^data:image\/(png|jpeg|webp);base64,/.test(a.image)) return;
+    let rec;
+    try { rec = await saveImage(await (await fetch(a.image)).blob()); } catch (err) { console.warn('[margin] picture failed', err); return; }
+    if (token !== this.run) return;
+    const k = Math.min(1, 300 / rec.w, 300 / rec.h), w = Math.round(rec.w * k), h = Math.round(rec.h * k);
+    const anchor = this.box(a.after) || this.lastBox();
+    const [x, y] = this.graphSpot(anchor, w, h);
+    this.onReveal?.([x, y, w, h]);
+    // fade in on Meta's layer, then hand it to the notebook as a picture the student can move or delete
+    const img = svgEl('image', { href: a.image, x, y, width: w, height: h, opacity: 0 }, this.svg);
+    await this.tween(this.fast ? 1 : 600, t => img.setAttribute('opacity', t), token);
+    img.remove();
+    if (token !== this.run) return;
+    const it = { type: 'image', blob: rec.id, x, y, w, h, by: 'meta', mk: 'picture', kept: true, rid: this.pid };
+    if (a.caption) it.say = a.caption;
+    this.nb.items.push(prepareItem(it));
+    this.nb.redraw();
   }
   // A legend line (`y = x sin x`): handwritten maths shrunk to fit the plot's width.
   async legend(m, text, short, x, base, maxW, token) {

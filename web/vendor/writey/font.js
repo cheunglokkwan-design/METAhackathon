@@ -2,11 +2,18 @@
 // Ported from Writey (MIT), github.com/lagoonitself/writey, packages/inkscript/src/font.ts:
 // TypeScript types stripped, imports made browser ES modules (no build step).
 import { GLYPHS } from './glyphs.js';
+import { PRINT_GLYPHS } from './glyphs_print.js';   // Margin addition: upright print letters (EMS Readability)
 /** Height of a lowercase letter, and of the math axis (where minus signs and fraction bars sit). */
 export const X_HEIGHT = 0.35;
 export const AXIS = 0.24;
 export const CAP_HEIGHT = 0.66;
 const cache = new Map();
+// Margin addition: 'print' (default) writes letters, digits and punctuation in upright print;
+// 'cursive' keeps Writey's EMS Allure. Maths operators and Greek always come from Allure.
+const PRINT_CHARS = /^[A-Za-z0-9.,:;!?'"()\[\]%&]$/;
+let style = 'print';
+export function setHandStyle(s) { if (s !== style) { style = s === 'cursive' ? 'cursive' : 'print'; cache.clear(); } }
+export const handStyle = () => style;
 const ALIASES = {
     '’': "'",
     '‘': "'",
@@ -24,7 +31,7 @@ export function glyph(ch) {
     const key = ALIASES[ch] ?? ch;
     if (cache.has(key))
         return cache.get(key) ?? null;
-    const raw = GLYPHS[key];
+    const raw = (style === 'print' && PRINT_CHARS.test(key) && PRINT_GLYPHS[key]) || GLYPHS[key];
     let g = null;
     if (raw) {
         const strokes = raw[1].map((s) => s.map((n) => n / 1000));

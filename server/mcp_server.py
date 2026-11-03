@@ -212,7 +212,7 @@ def ask_margin(lines: list[str], command: str = "help me", hint_level: int = 1) 
         out = meta_client.run_agent(command[:500], page, None, hint_level=box.level, toolbox=box)
     if out is None:
         intent = meta_client.keyword_intent(command)
-        out = box.route(intent, f"{'offline' if meta_client.is_offline() else 'agent unavailable'}: keywords -> {intent}")
+        out = box.route(intent, f"{'offline' if meta_client.is_offline() else 'agent unavailable'}: keywords -> {intent}", command)
     return {"mode": out["mode"], "agent_trace": out["agent_trace"], "first_wrong": box.result.first_wrong,
             "verdict": box.result.verdict, "lines": _lines_out(box), "marks": _marks(box),
             "notes": [a["text"] for a in box.annotations if a.get("kind") == "note"],

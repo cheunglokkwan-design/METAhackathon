@@ -2,6 +2,7 @@
 import { Notebook, PAGE_W, PAGE_H, PEN_SIZES, rowY, RULE, isMeta } from './ink.js';
 import { saveImage, savePdfPages, isPdf } from './images.js';
 import { MetaInk, assist, META_COLOR } from './assistant.js';
+import { setHandStyle } from './handwriting.js';
 import { Suggest } from './suggest.js';
 import { Voice } from './voice.js';
 import { store, authClient, newPage, createNotebook } from './store.js';
@@ -497,6 +498,18 @@ function showMetaInk() {
   $$('[data-meta-ink]').forEach(b => b.setAttribute('aria-pressed', b.dataset.metaInk === metaInk));
   meta.syncColor();
 }
+// Meta's handwriting: upright print (default, easy to read) or Writey's cursive.
+let handPref = 'print';
+try { if (localStorage.getItem('margin.handStyle') === 'cursive') handPref = 'cursive'; } catch { /* private mode */ }
+setHandStyle(handPref);
+const syncHandSeg = () => $$('[data-hand]').forEach(b => b.setAttribute('aria-pressed', b.dataset.hand === handPref));
+syncHandSeg();
+$$('[data-hand]').forEach(b => b.onclick = () => {
+  handPref = b.dataset.hand; setHandStyle(handPref); syncHandSeg();
+  try { localStorage.setItem('margin.handStyle', handPref); } catch { /* private mode */ }
+  toast(handPref === 'print' ? 'Meta now writes in clear print.' : 'Meta now writes in cursive.');
+});
+
 $$('[data-meta-ink]').forEach(b => b.onclick = e => {
   e.stopPropagation();
   const prev = metaColor();

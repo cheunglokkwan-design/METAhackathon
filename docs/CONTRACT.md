@@ -41,7 +41,9 @@ Tools, each executed locally by the SymPy referee; every annotation comes from a
 | `next_step` | `write`s ONLY the next single step after the last correct line (verified by the referee first); if a line is wrong, hint behaviour instead (circle + note) | `next` (`hint` when a line is wrong) |
 | `explain_rule` | a short "why" `note` (rule + formula) beside the latest step, or beside the first mistake (+ `circle`) | `why` |
 | `typeset_lines` | a `typeset` annotation per readable line | `typeset` |
-| `sketch_graph` | one `graph` annotation | `graph` |
+| `sketch_graph` | one `graph` annotation (a `graph3d` when the function has two variables) | `graph` |
+| `sketch_3d` | one `graph3d` annotation: `fn`, `xs`, `ys`, `z` (rows over `ys`, `null` where undefined), `zrange` | `graph` |
+| `draw_picture` | one `picture` annotation: `image` (a `data:image/...;base64` URL from Muse Image), `caption` | `picture` |
 | `differentiate_check` | d/dx of the student's antiderivative vs the integrand (derivative pages: same as check_steps) | `check` |
 
 Online + `mode: "auto"`: Muse Spark gets the command, the page lines and the tool

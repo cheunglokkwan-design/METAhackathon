@@ -7,6 +7,7 @@ import { layoutParagraph } from './vendor/writey/text.js';
 import { penTimes } from './vendor/writey/hand.js';
 
 export { penTimes };
+export { setHandStyle, handStyle } from './vendor/writey/font.js';
 export const newSeed = () => (Math.random() * 2 ** 32) >>> 0;
 
 /** Pen width for a writing size, as Writey's writer picks it (writer.ts penWidth). */

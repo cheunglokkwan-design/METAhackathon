@@ -225,6 +225,11 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
         trace.append({"tool": "read_page", "summary": (f"read {len(lines)} line(s) from the page" if lines
                                                         else f"read nothing: {why}"[:90])})
 
+    if not lines and not offline and req.mode == "auto" and meta_client.keyword_intent(req.command) == "picture":
+        box = skills.Toolbox([], level)                 # a picture needs no maths on the page
+        out = box.route("picture", "picture on an empty page", req.command)
+        return {"mode": "picture", "offline": offline, "lines": [], "first_wrong": None, "verdict": "",
+                "annotations": out["annotations"], "agent_trace": trace + out["agent_trace"]}
     if not lines:
         mode = req.mode if req.mode != "auto" else meta_client.keyword_intent(req.command)
         mode = skills.TOOL_MODE.get(skills.INTENT_TOOL.get(mode, "give_hint"), "hint")
@@ -256,7 +261,7 @@ def build_response(req: AssistRequest) -> dict[str, Any]:
     if out is None:
         intent = meta_client.keyword_intent(req.command)
         why = "offline" if offline else "agent unavailable"
-        out = box.route(intent, f"{why}: keywords -> {intent}")
+        out = box.route(intent, f"{why}: keywords -> {intent}", req.command)
 
     result = box.result
     bbox_by_id = {l["id"]: l.get("bbox") for l in lines}
@@ -302,6 +307,15 @@ def health_db() -> dict[str, Any]:
     }
 
 
+def _without_pictures(resp: dict[str, Any]) -> dict[str, Any]:
+    """The response as stored: generated pictures (megabytes of base64) are left out."""
+    anns = resp.get("annotations") or []
+    if not any(a.get("kind") == "picture" for a in anns):
+        return resp
+    return {**resp, "annotations": [{**a, "image": "(picture not stored)"} if a.get("kind") == "picture" else a
+                                    for a in anns]}
+
+
 @app.post("/api/assist")
 def assist(
     req: AssistRequest,
@@ -340,7 +354,7 @@ def assist(
                 hint_level=req.hint_level,
                 image_dataurl=req.image,
                 input_lines=typed_lines,
-                response_data=resp,
+                response_data=_without_pictures(resp),
                 latency_ms=latency_ms,
             )
             resp["interaction_id"] = interaction_id

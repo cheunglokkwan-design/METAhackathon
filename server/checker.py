@@ -57,6 +57,7 @@ class ParsedLine:
     # part index -> (F, var, a, b) for an evaluation bracket [F]_a^b written on that part
     brackets: dict[int, tuple[sp.Expr, sp.Symbol, sp.Expr, sp.Expr]] = field(default_factory=dict)
     defines: str | None = None  # "f" for a definition line like f(x) = x^2 sin x
+    asks_value: bool = False    # ends in a bare "=": the student wants it worked out ("30 sin 30 =")
 
     @property
     def ok(self) -> bool:
@@ -280,7 +281,7 @@ def _strip_c(part: str) -> tuple[str, bool]:
     return part, False
 
 
-DEF_RE = re.compile(r"^\s*(?:([a-dfghk-wzA-Z])\s*\(\s*([a-z])\s*\)|(y))\s*=\s*([^=]+)$")
+DEF_RE = re.compile(r"^\s*(?:([a-dfghk-wzA-Z])\s*\(\s*([a-z])\s*(?:,\s*[a-z]\s*)?\)|([a-dfghj-wyzA-Z]))\s*=\s*([^=]+=?\s*)$")
 
 
 def parse_line(text: str, defs: dict[str, tuple[sp.Expr, sp.Symbol]] | None = None) -> ParsedLine:
@@ -309,6 +310,9 @@ def parse_line(text: str, defs: dict[str, tuple[sp.Expr, sp.Symbol]] | None = No
         line.continuation = True
         s = s[1:]
     raw_parts = [p.strip() for p in s.split("=")]
+    if len(raw_parts) > 1 and not raw_parts[-1] and any(raw_parts[:-1]):
+        raw_parts.pop()                     # "30 sin 30 =": a request to evaluate, not an empty side
+        line.asks_value = True
     for k, raw in enumerate(raw_parts):
         if not raw:
             line.parts.append(None)
@@ -947,7 +951,8 @@ def check_lines(lines: list[Any]) -> CheckResult:
             cmp = _Comparator(var, integral_chain, chain)
             final = integral_chain and not expr.has(sp.Integral)
             bracket = p.brackets.get(k + offset)
-            if _bracket_ok(prev, bracket) and cmp.same(expr, prev):
+            deg = degree_reading(prev) if chain == "algebra" else None
+            if _bracket_ok(prev, bracket) and (cmp.same(expr, prev) or (deg is not None and cmp.same(expr, deg))):
                 prev = last_good = expr
                 bracket_pending = bracket is not None
                 if final and not has_c:
@@ -1082,6 +1087,60 @@ def _solve_definite(value: sp.Expr, var: sp.Symbol, pending: bool = False) -> li
     return steps
 
 
+# Whole-number angles a student means in degrees (sin 30, cos 60, tan 45 ...).
+DEGREE_ANGLES = {15, 30, 45, 60, 75, 90, 105, 120, 135, 150, 165, 180, 210, 225, 240, 270, 300, 315, 330, 360}
+TRIG = (sp.sin, sp.cos, sp.tan, sp.cot, sp.sec, sp.csc)
+
+
+def degree_reading(expr: sp.Expr) -> sp.Expr | None:
+    """`expr` with whole-number trig angles read as degrees, when every such angle is a common degree
+    value (sin 30 -> sin(pi/6)); None when nothing in it looks like degrees."""
+    calls = [f for f in expr.atoms(*TRIG) if f.args[0].is_number]
+    if not calls or any(not f.args[0].is_Integer or abs(int(f.args[0])) not in DEGREE_ANGLES for f in calls):
+        return None
+    return expr.xreplace({f: f.func(f.args[0] * sp.pi / 180) for f in calls})
+
+
+def evaluate_value(expr: sp.Expr, asked: bool = False) -> tuple[str, str | None] | None:
+    """("= 15", "30 taken as degrees") for a line the student wants worked out; None if it can't be."""
+    deg = degree_reading(expr)
+    use = deg if deg is not None else expr
+    try:
+        val = sp.nsimplify(sp.simplify(use), rational=False) if not use.free_symbols else sp.simplify(use)
+    except Exception:
+        return None
+    if val.has(sp.zoo, sp.nan, sp.oo, -sp.oo):
+        return None
+    approx = None
+    if not val.free_symbols and not val.is_Rational:
+        try:
+            approx = f"{float(val):.4g}"
+        except (TypeError, ValueError):
+            pass
+    if val == expr:
+        if not asked or (val.free_symbols or (not val.is_Rational and approx is None)):
+            return None
+        text = f"= {pretty(val)}" if val.is_Rational else f"≈ {approx}"
+    else:
+        text = f"= {pretty(val)}" + (f" ≈ {approx}" if approx else "")
+    if deg is not None:
+        angles = sorted({str(abs(int(f.args[0]))) for f in expr.atoms(*TRIG) if f.args[0].is_number})
+        return text, f"Taking {', '.join(angles)} as degrees"
+    return text, None
+
+
+def trig_values(expr: sp.Expr) -> list[str]:
+    """`sin 30° = 1/2` for each degree-angle trig term (a level-2 hint)."""
+    if degree_reading(expr) is None:
+        return []
+    out = []
+    for f in sorted(expr.atoms(*TRIG), key=str):
+        if f.args[0].is_number:
+            v = sp.simplify(f.func(f.args[0] * sp.pi / 180))
+            out.append(f"{f.func.__name__} {int(f.args[0])}° = {pretty(v)}")
+    return out
+
+
 def solve_remaining(lines: list[Any]) -> list[str]:
     """Steps (as ink text, each starting with '=') that finish the last problem.
 
@@ -1097,8 +1156,9 @@ def solve_remaining(lines: list[Any]) -> list[str]:
     if res.chain == "definite":
         return _solve_definite(value, var, res.bracket_pending)
     if not res.integral_chain:
-        simp = sp.simplify(value)
-        return [] if simp == value else [f"= {pretty(simp)}"]
+        asked = bool(res.lines) and res.lines[-1].parsed.asks_value
+        ev = evaluate_value(value, asked)
+        return [ev[0]] if ev else []
     if not value.has(sp.Integral):
         return []
     had_log = any(i.function.has(sp.log) for i in value.atoms(sp.Integral))
