@@ -945,8 +945,33 @@ const voice = new Voice({
   },
   onError: msg => { voiceNote(msg, !/^Mic turned off|^Two minutes/.test(msg)); openCmd('', { focus: false }); toast(msg); },
   onLog: line => { vLog.textContent = line; },
+  onLevel: peak => showLevel(peak),
+  onMics: () => listMics(),
   onWake: on => showWake(on),                       // voice turned wake mode off by itself
 });
+// Live mic level while recording (green; red while it stays under 5%, too quiet for Meta), and a mic picker.
+const vMeter = $('#cmd .vmeter'), vBarFill = $('#cmd .vmeter i'), vMic = $('#cmd .vmic');
+let levelHold = 0;
+function showLevel(peak) {
+  vMeter.hidden = peak == null;
+  if (peak == null) { levelHold = 0; return; }
+  levelHold = Math.max(peak, levelHold * 0.9);
+  vBarFill.style.width = `${Math.min(100, Math.sqrt(levelHold) * 100)}%`;
+  vMeter.classList.toggle('low', levelHold < 0.05);
+  vMeter.title = `Mic level ${Math.round(levelHold * 100)}%`;
+}
+async function listMics() {
+  const mics = await voice.mics();
+  vMic.hidden = mics.length < 2 || !mics.some(m => m.label);
+  if (vMic.hidden) return;
+  const opts = mics.map((m, i) => new Option(m.label || `Microphone ${i + 1}`, m.deviceId === 'default' ? '' : m.deviceId));
+  if (!opts.some(o => o.value === '')) opts.unshift(new Option('Default mic', ''));
+  vMic.replaceChildren(...opts);
+  vMic.value = [...vMic.options].some(o => o.value === voice.micId) ? voice.micId : '';
+}
+vMic.onchange = () => { voice.setMic(vMic.value); voiceNote(`Voice now uses ${vMic.selectedOptions[0]?.text || 'the default mic'}.`); };
+navigator.mediaDevices?.addEventListener?.('devicechange', listMics);
+listMics();
 vEngine.onclick = () => { voice.setEngine(voice.engine === 'browser' ? 'meta' : 'browser'); voiceNote(`Voice now uses ${voice.engineName}.`); };
 function showWake(on) {
   wakeBtn.setAttribute('aria-pressed', on);

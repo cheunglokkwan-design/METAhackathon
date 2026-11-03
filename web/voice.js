@@ -13,7 +13,8 @@ export const SILENCE_MS = 10000;                     // turn off after 10 s with
 const META_MAX_MS = 120000;                          // 2 min of 16 kHz WAV is ~3.8 MB, under Vercel's 4.5 MB body limit
 const WAV_RATE = 16000;
 const LIVE_RATE = 24000;                             // Meta live voice takes PCM_24KHZ
-const ENGINE_KEY = 'margin.voiceEngine';
+const ENGINE_KEY = 'margin.voiceEngine', MIC_KEY = 'margin.micId';
+const LOW_PEAK = 0.05;                               // under 5% Meta often hears no words
 // Web Speech errors that mean "this browser can't do speech here": use Meta instead.
 const SWITCH_ERRORS = new Set(['network', 'service-not-allowed', 'language-not-supported']);
 const UPLOAD_ERRORS = {
@@ -88,6 +89,29 @@ export class Voice {
     this.h = h; this.on = false; this.wake = false; this.rec = null; this.recording = null; this.serverOk = undefined;
     let saved = null; try { saved = localStorage.getItem(ENGINE_KEY); } catch { /* private mode */ }
     this.engine = SR ? (saved === 'meta' ? 'meta' : 'browser') : 'meta';
+    try { this.micId = localStorage.getItem(MIC_KEY) || ''; } catch { this.micId = ''; }
+    this.micName = '';
+  }
+  // Microphones the browser can see (names appear once the mic has been allowed once).
+  async mics() {
+    try { return (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'audioinput' && d.deviceId !== 'communications'); }
+    catch { return []; }
+  }
+  setMic(id) { this.micId = id || ''; try { localStorage.setItem(MIC_KEY, this.micId); } catch { /* private mode */ } }
+  // The browser's own level control stays on; the chosen mic is used if it is still plugged in.
+  async openMic() {
+    const audio = { echoCancellation: true, noiseSuppression: false, autoGainControl: true };
+    let stream;
+    if (this.micId) {
+      try { stream = await navigator.mediaDevices.getUserMedia({ audio: { ...audio, deviceId: { exact: this.micId } } }); }
+      catch (err) { if (err.name === 'NotAllowedError' || err.name === 'SecurityError') throw err; this.setMic(''); }
+    }
+    stream ||= await navigator.mediaDevices.getUserMedia({ audio });
+    const track = stream.getAudioTracks()[0], set = track?.getSettings?.() || {};
+    this.micName = track?.label || 'default mic';
+    this.log(`mic: ${this.micName}${set.autoGainControl === false ? ' (auto level off)' : ''}`);
+    this.h.onMics?.();
+    return stream;
   }
   get supported() { return !!SR || !!window.MediaRecorder; }
   get canChoose() { return !!SR; }
@@ -197,7 +221,7 @@ export class Voice {
       return;
     }
     let stream;
-    try { stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: false, autoGainControl: true } }); }
+    try { stream = await this.openMic(); }
     catch (err) { ctx?.close?.(); this.on = false; this.state('off'); this.fail(`Microphone blocked (${err.name || 'error'}). Allow the mic for this site.`); return; }
     if (!this.on) { stream.getTracks().forEach(t => t.stop()); ctx?.close?.(); return; }   // turned off while asking
     if (this.realtime && ctx) {
@@ -237,6 +261,7 @@ export class Voice {
         const text = clean(this.prefix + (body.text || ''));
         if (text) this.h.onText?.(text);
         else if (body.unclear) throw new Error(`Meta only caught “${body.unclear}” from ${wav.seconds.toFixed(1)} s of audio, so it probably misheard. Try again a little closer to the mic` + (SR ? ', or use Browser speech in the bar.' : '.'));
+        else if (wav.peak < LOW_PEAK) throw new Error(`Meta heard no words: your mic (${this.micName}) only reached ${level}%, which is too quiet. Pick another mic in the bar, or turn up its input volume in your computer’s sound settings (Windows: Settings › System › Sound › Input; Mac: System Settings › Sound › Input).`);
         else throw new Error(`Meta got ${wav.seconds.toFixed(1)} s of audio (level ${level}%) but found no words${body.session ? ` (session ${body.session})` : ''}. ` + (SR ? 'Try Browser speech in the bar instead.' : 'Try again, speaking a little louder.'));
       } catch (err) {
         this.fail(err.message || String(err));
@@ -260,7 +285,7 @@ export class Voice {
       const finish = () => {
         if (done) return; done = true;
         stopCapture(); clearTimeout(this.liveFlush);
-        this.liveStop = null; this.on = false;
+        this.liveStop = null; this.on = false; this.h.onLevel?.(null);
         stream.getTracks().forEach(t => t.stop()); ctx.close?.();
         const text = words();
         if (text) { this.h.onText?.(text); this.log('done'); }
@@ -289,6 +314,7 @@ export class Voice {
           }
           pos = pos + n * step - inp.length;
           if (gate.hear(Math.sqrt(sq / n))) this.lastSpeech = Date.now();
+          this.h.onLevel?.(peak);
           const out = new Int16Array(n);                // raw audio, as the mic heard it
           for (let i = 0; i < n; i++) { const v = Math.max(-1, Math.min(1, mono[i])); out[i] = v < 0 ? v * 0x8000 : v * 0x7fff; }
           ws.send(out.buffer);
@@ -334,13 +360,14 @@ export class Voice {
       const buf = new Float32Array(an.fftSize), gate = new SpeechGate();
       const tick = () => {
         an.getFloatTimeDomainData(buf);
-        let sum = 0; for (const v of buf) sum += v * v;
+        let sum = 0, peak = 0; for (const v of buf) { sum += v * v; if (Math.abs(v) > peak) peak = Math.abs(v); }
         if (ctx.state === 'running' && gate.hear(Math.sqrt(sum / buf.length))) this.lastSpeech = Date.now();
+        this.h.onLevel?.(peak);
         raf = requestAnimationFrame(tick);
       };
       ctx.resume?.(); raf = requestAnimationFrame(tick);
     } catch { ctx.close?.(); this.lastSpeech = Infinity; return () => {}; }
-    return () => { cancelAnimationFrame(raf); ctx?.close?.(); };
+    return () => { cancelAnimationFrame(raf); this.h.onLevel?.(null); ctx?.close?.(); };
   }
 
   // ---- "Hey Meta" wake mode (browser engine only) -------------------------------------------------
