@@ -84,3 +84,43 @@ def test_a_timeout_is_retried_once_and_explained(monkeypatch):
     _online(monkeypatch, Dead([]))
     assert meta_client.read_page(IMG) == []
     assert meta_client.read_error_text(meta_client.last_read_error) == "Meta took too long to answer"
+
+
+class NotFound(Exception):
+    status_code = 404
+
+    def __init__(self, model):
+        super().__init__("not found")
+        self.body = {"error": {"message": f"The model `{model}` does not exist or is not available",
+                               "code": "model_not_found"}}
+
+
+def test_unknown_model_falls_back_to_a_muse_spark_that_exists(monkeypatch):
+    seen = []
+
+    def create(**kw):
+        seen.append(kw["model"])
+        if kw["model"] != "muse-spark-1.2":
+            raise NotFound(kw["model"])
+        msg = SimpleNamespace(content='{"lines": ["30 sin 30 ="]}', tool_calls=None)
+        return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")], usage=None)
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    _online(monkeypatch, fake)
+    monkeypatch.setattr(meta_client, "CHAT_MODEL", "muse-spark-9")
+    monkeypatch.setitem(meta_client._working, "model", None)
+    assert [l["text"] for l in meta_client.read_page(IMG)] == ["30 sin 30 ="]
+    assert seen[0] == "muse-spark-9" and "muse-spark-1.2" in seen
+    assert meta_client.chat_model() == "muse-spark-1.2"
+
+
+def test_404_everywhere_says_which_settings_to_check(monkeypatch):
+    def create(**kw):
+        raise NotFound(kw["model"])
+
+    fake = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    _online(monkeypatch, fake)
+    monkeypatch.setitem(meta_client._working, "model", None)
+    assert meta_client.read_page(IMG) == []
+    assert meta_client.last_read_error.startswith("Meta API error 404 (The model")
+    assert "CHAT_MODEL" in meta_client.read_error_text(meta_client.last_read_error)

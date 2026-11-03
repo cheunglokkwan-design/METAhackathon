@@ -37,7 +37,7 @@ from .db import (
     StorageQuotaExceededError,
     db,
 )
-from .meta_client import CHAT_MODEL, OfflineError
+from .meta_client import OfflineError
 
 logging.basicConfig(level=logging.INFO)
 WEB_DIR = Path(__file__).resolve().parent.parent / "web"
@@ -283,7 +283,7 @@ annotate = skills.annotate  # kept for callers of the old location
 
 @app.get("/api/health")
 def health() -> dict[str, Any]:
-    out = {"ok": True, "offline": meta_client.is_offline(), "model": CHAT_MODEL, "realtime": realtime.available()}
+    out = {"ok": True, "offline": meta_client.is_offline(), "model": meta_client.chat_model(), "realtime": realtime.available()}
     if router.enabled():
         out["router"] = {"model": os.getenv("ROUTER_MODEL", ""), "circuit_breaker": router.circuit_breaker.state}
     return out

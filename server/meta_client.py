@@ -23,7 +23,7 @@ load_dotenv()
 log = logging.getLogger("margin.meta")
 
 BASE_URL = os.getenv("MODEL_BASE_URL", "https://api.meta.ai/v1")
-CHAT_MODEL = os.getenv("CHAT_MODEL", "muse-spark-1.3")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "muse-spark-1.3").strip().lower() or "muse-spark-1.3"
 VOICE_MODEL = os.getenv("VOICE_MODEL", "muse-voice-transcribe-1.0")
 IMAGE_MODEL = os.getenv("IMAGE_MODEL", "muse-image-1.0")
 MAX_PICTURE_B64 = 3_000_000          # keeps the reply under Vercel's 4.5 MB response limit
@@ -165,13 +165,65 @@ def is_offline() -> bool:
     return not api_key()
 
 
+DEFAULT_BASE_URL = "https://api.meta.ai/v1"
+MODEL_FALLBACKS = ("muse-spark-1.3", "muse-spark-1.2", "muse-spark-1.1")
+# What answered last time after a 404 (a wrong CHAT_MODEL or MODEL_BASE_URL in the host's settings).
+_working: dict[str, str | None] = {"model": None, "base": None}
+
+
+def chat_model() -> str:
+    return _working["model"] or CHAT_MODEL
+
+
 def _client():
     """OpenAI SDK client pointed at the Meta Model API, or None offline."""
     if is_offline():
         return None
     from openai import OpenAI
 
-    return OpenAI(base_url=base_url(), api_key=api_key(), timeout=30.0, max_retries=1)
+    return OpenAI(base_url=_working["base"] or base_url(), api_key=api_key(), timeout=30.0, max_retries=1)
+
+
+def _err_detail(exc: Exception) -> str:
+    """Meta's own short error message, if the reply had one."""
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        msg = (body.get("error") or {}).get("message") if isinstance(body.get("error"), dict) else body.get("message")
+        if msg:
+            return str(msg)[:120]
+    return ""
+
+
+def _complete(client, **kw):
+    """chat.completions.create with the working model. On a 404 (unknown model or wrong address)
+    it tries Meta's default address and the other Muse Spark versions, and remembers what worked."""
+    model = chat_model()
+    try:
+        return client.chat.completions.create(model=model, **kw)
+    except Exception as exc:
+        if getattr(exc, "status_code", None) != 404:
+            raise
+        first = exc
+    log.warning("Meta 404 for model %s at %s: %s", model, _working["base"] or base_url(), _err_detail(first) or "no body")
+    tries = []
+    if (_working["base"] or base_url()).rstrip("/") != DEFAULT_BASE_URL and hasattr(client, "with_options"):
+        tries.append((DEFAULT_BASE_URL, model))
+        tries += [(DEFAULT_BASE_URL, m) for m in MODEL_FALLBACKS if m != model]
+    tries += [(None, m) for m in MODEL_FALLBACKS if m != model]
+    for base, m in tries:
+        c = client.with_options(base_url=base) if base else client
+        try:
+            resp = c.chat.completions.create(model=m, **kw)
+        except Exception as exc:
+            if getattr(exc, "status_code", None) == 404:
+                continue
+            raise
+        log.warning("Meta answered with model %s at %s; using that from now on", m, base or "the configured address")
+        _working["model"] = m
+        if base:
+            _working["base"] = base
+        return resp
+    raise first
 
 
 def _chat(messages: list[dict[str, Any]], max_tokens: int = 1500) -> str | None:
@@ -191,9 +243,7 @@ def _chat(messages: list[dict[str, Any]], max_tokens: int = 1500) -> str | None:
         log.warning("Meta API rate limit exceeded, using offline fallback")
         return None
     try:
-        resp = client.chat.completions.create(
-            model=CHAT_MODEL, messages=messages, max_tokens=max_tokens, temperature=0.2
-        )
+        resp = _complete(client, messages=messages, max_tokens=max_tokens, temperature=0.2)
         circuit_breaker.record_success()
         return (resp.choices[0].message.content or "").strip()
     except Exception as exc:
@@ -321,6 +371,9 @@ def read_error_text(reason: str | None) -> str:
         return "Meta ran out of thinking room"
     if "too large" in r:
         return "the page picture was too big"
+    if "error 404" in r:
+        return ("Meta couldn't find the model or the API address (check CHAT_MODEL and MODEL_BASE_URL "
+                "in the host's settings, or remove them)")
     if "error 5" in r:
         return "Meta's server had an error"
     if "connection" in r:
@@ -349,8 +402,7 @@ def _chat_full(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str | N
         try:
             # Reading handwriting is a reasoning call: give it more time than the 30 s default.
             c = client.with_options(timeout=READ_TIMEOUT_S, max_retries=0) if hasattr(client, "with_options") else client
-            resp = c.chat.completions.create(
-                model=CHAT_MODEL, messages=messages, max_tokens=max_tokens)
+            resp = _complete(c, messages=messages, max_tokens=max_tokens)
             break
         except Exception as exc:
             status = getattr(exc, "status_code", None)
@@ -359,7 +411,8 @@ def _chat_full(messages: list[dict[str, Any]], max_tokens: int) -> tuple[str | N
             if attempt == 0 and transient:
                 continue                                   # one more try for timeouts and server errors
             circuit_breaker.record_failure()
-            return None, f"Meta API error {status or type(exc).__name__}"
+            detail = _err_detail(exc)
+            return None, f"Meta API error {status or type(exc).__name__}" + (f" ({detail})" if detail else "")
     circuit_breaker.record_success()
     choice = resp.choices[0]
     text = (choice.message.content or "").strip()
@@ -558,9 +611,8 @@ def run_agent(command: str, lines: list[dict[str, Any]], image: str | None = Non
             box.trace.append({"tool": "muse-spark", "summary": "rate limit exceeded; stopped"})
             break
         try:
-            resp = client.chat.completions.create(
-                model=CHAT_MODEL, messages=messages, tools=TOOL_SPECS, tool_choice="auto",
-                max_tokens=4000, temperature=0.2)
+            resp = _complete(client, messages=messages, tools=TOOL_SPECS, tool_choice="auto",
+                             max_tokens=4000, temperature=0.2)
             circuit_breaker.record_success()
             msg = resp.choices[0].message
         except Exception as exc:
